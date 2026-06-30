@@ -1,3 +1,4 @@
+
 """Background control worker.
 
 The GUI thread must never block on serial / CAN IO, so all bus interaction
@@ -22,7 +23,7 @@ from PySide6.QtCore import QObject, Signal
 
 from . import protocol as proto
 from .bus import BusConfig, Motor, RobstrideBus
-from .protocol import MotorStatus, RunMode
+from .protocol import MotorStatus, ParameterType, RunMode
 from .safety import Calibration, SafetyLimits, SafetyState
 from .transport import Transport, TransportError
 
@@ -138,6 +139,25 @@ class SetMotorId(Command):
     new_id: int
 
 
+# --- board power telemetry ------------------------------------------------------
+
+#: Read VBUS/Iq once every Nth control loop. The control loop runs at 100 Hz; a
+#: divisor of 20 polls the board power registers at ~5 Hz, which is plenty for a
+#: voltage/current readout while keeping the extra READ_PARAMETER round-trips off
+#: the hot path so they never delay a setpoint write.
+POWER_READ_DIVISOR: int = 20
+
+
+@dataclass(frozen=True)
+class PowerInfo:
+    """Electrical telemetry read from the motor control board."""
+
+    device_id: int
+    vbus: float       # bus voltage, V
+    iq: float         # filtered q-axis current, A
+    power: float      # estimated input power VBUS*Iq, W
+
+
 # --- per-motor live target ------------------------------------------------------
 
 
@@ -156,6 +176,7 @@ class ControlWorker(QObject):
     """Runs the control loop; lives in its own QThread."""
 
     statusUpdated = Signal(int, object)   # device_id, MotorStatus
+    powerUpdated = Signal(int, object)    # device_id, PowerInfo
     connectionChanged = Signal(bool)
     scanFinished = Signal(list)           # list[int]
     busCollision = Signal(list)           # list[int]: ids answered by >1 motor
@@ -176,6 +197,7 @@ class ControlWorker(QObject):
         self._last_raw_pos: dict[int, float] = {}
         self._safety = SafetyState(SafetyLimits.for_model(proto.DEFAULT_MODEL))
         self._rate_hz = rate_hz
+        self._loop_count = 0
 
     # -- public, thread-safe API (called from the GUI thread) --------------------
 
@@ -192,6 +214,7 @@ class ControlWorker(QObject):
         period = 1.0 / self._rate_hz
         while self._running:
             t0 = time.monotonic()
+            self._loop_count += 1
             self._drain_commands()
             if self._bus is not None and self._bus.is_open:
                 self._service_motors()
@@ -413,6 +436,7 @@ class ControlWorker(QObject):
     # -- per-loop servicing ------------------------------------------------------
 
     def _service_motors(self) -> None:
+        read_power = self._loop_count % POWER_READ_DIVISOR == 0
         for device_id, target in list(self._targets.items()):
             if not target.enabled or self._safety.estop:
                 continue
@@ -423,6 +447,28 @@ class ControlWorker(QObject):
                 continue
             if status is not None:
                 self.statusUpdated.emit(device_id, status)
+            if read_power:
+                self._read_power(device_id)
+
+    def _read_power(self, device_id: int) -> None:
+        """Read the board's bus voltage and current and emit derived power.
+
+        These are plain READ_PARAMETER round-trips (never a motion frame), so
+        they are safe to interleave with the control loop without disturbing the
+        motor. Done at ~5 Hz via :data:`POWER_READ_DIVISOR` to keep them off the
+        hot path. A non-responding read leaves the value out and emits nothing.
+        """
+        try:
+            vbus = self._bus.read_param(device_id, ParameterType.VBUS)
+            iq = self._bus.read_param(device_id, ParameterType.IQ_FILTERED)
+        except TransportError as e:
+            self.error.emit(str(e))
+            return
+        if vbus is None or iq is None:
+            return
+        vbus = float(vbus)
+        iq = float(iq)
+        self.powerUpdated.emit(device_id, PowerInfo(device_id, vbus, iq, vbus * iq))
 
     def _command_motor(self, device_id: int, t: MotorTarget) -> Optional[MotorStatus]:
         """Clamp the target in the *user* frame, convert to the *raw* motor frame

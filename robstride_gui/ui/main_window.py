@@ -10,13 +10,14 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QComboBox, QDockWidget, QHBoxLayout, QInputDialog, QLabel,
+    QCheckBox, QComboBox, QDockWidget, QHBoxLayout, QInputDialog, QLabel,
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTabWidget,
     QVBoxLayout, QWidget,
 )
 
 from .. import protocol as proto
 from ..bus import Motor
+from ..datalog import TelemetryLogger
 from ..presets import Preset, PresetStore
 from ..protocol import MotorStatus
 from ..transport import (
@@ -38,8 +39,14 @@ class MainWindow(QMainWindow):
 
         self.panels: dict[int, MotorPanel] = {}
         self.presets = PresetStore().load()
+        # Mirrors the live graph feedback (pos/vel/torque/temp + power) to a
+        # separate .txt data file for offline review.
+        self.datalog = TelemetryLogger()
         self._connected = False
         self.device_dialog: DeviceDialog | None = None
+        # Remembers whether the window was maximized before entering fullscreen
+        # so leaving fullscreen restores that state instead of a small window.
+        self._was_maximized = False
 
         self._start_worker()
         self._build_ui()
@@ -60,6 +67,7 @@ class MainWindow(QMainWindow):
         self.thread.started.connect(self.worker.run)
 
         self.worker.statusUpdated.connect(self._on_status)
+        self.worker.powerUpdated.connect(self._on_power)
         self.worker.connectionChanged.connect(self._on_connection_changed)
         self.worker.scanFinished.connect(self._on_scan_finished)
         self.worker.busCollision.connect(self._on_bus_collision)
@@ -94,12 +102,19 @@ class MainWindow(QMainWindow):
 
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
-            self.showNormal()
+            self._exit_fullscreen()
         else:
+            # Capture the pre-fullscreen state so Esc/F11 can restore it.
+            self._was_maximized = self.isMaximized()
             self.showFullScreen()
 
     def _exit_fullscreen(self) -> None:
-        if self.isFullScreen():
+        if not self.isFullScreen():
+            return
+        # showNormal() would forget a maximized window; restore it explicitly.
+        if self._was_maximized:
+            self.showMaximized()
+        else:
             self.showNormal()
 
     def _build_connection_bar(self) -> QWidget:
@@ -182,6 +197,24 @@ class MainWindow(QMainWindow):
 
     def _build_log_dock(self) -> None:
         self.log_dock = QDockWidget("Log", self)
+        container = QWidget()
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(4, 4, 4, 4)
+
+        # Telemetry recording is opt-in: nothing is written to disk unless the
+        # user ticks this box. The label shows where the data went.
+        controls = QHBoxLayout()
+        self.record_check = QCheckBox("Record telemetry to file")
+        self.record_check.setToolTip(
+            "Save the live graph feedback (position/velocity/torque/temp) to a "
+            ".txt data file while ticked")
+        self.record_check.toggled.connect(self._on_record_toggled)
+        controls.addWidget(self.record_check)
+        self.record_path_label = QLabel("")
+        self.record_path_label.setStyleSheet("color:#888;")
+        controls.addWidget(self.record_path_label, 1)
+        lay.addLayout(controls)
+
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(2000)
@@ -189,10 +222,26 @@ class MainWindow(QMainWindow):
         # so the log is effectively invisible. Give it a usable floor and a
         # sensible initial size.
         self.log_view.setMinimumHeight(120)
-        self.log_dock.setWidget(self.log_view)
+        lay.addWidget(self.log_view)
+
+        self.log_dock.setWidget(container)
         self.log_dock.setMinimumHeight(140)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
         self.resizeDocks([self.log_dock], [220], Qt.Vertical)
+
+    def _on_record_toggled(self, checked: bool) -> None:
+        if checked:
+            path = self.datalog.start()
+            if path is None:
+                self.record_check.setChecked(False)
+                self._append_log("ERROR: could not open telemetry log file")
+                return
+            self.record_path_label.setText(f"recording -> {path}")
+            self._append_log(f"Telemetry recording started: {path}")
+        else:
+            self.datalog.stop()
+            self.record_path_label.setText("")
+            self._append_log("Telemetry recording stopped")
 
     def _build_preset_dock(self) -> None:
         dock = QDockWidget("Presets", self)
@@ -410,6 +459,19 @@ class MainWindow(QMainWindow):
         panel = self.panels.get(device_id)
         if panel is not None:
             panel.update_status(status)
+        faults = ",".join(name for name, flag in (
+            ("stall", status.stalled), ("encoder", status.encoder_fault),
+            ("overtemp", status.overtemperature), ("overcur", status.overcurrent),
+            ("undervolt", status.undervoltage)) if flag)
+        self.datalog.log_status(device_id, status.position, status.velocity,
+                                status.torque, status.temperature, faults)
+
+    @Slot(int, object)
+    def _on_power(self, device_id: int, power: object) -> None:
+        panel = self.panels.get(device_id)
+        if panel is not None:
+            panel.update_power(power)
+        self.datalog.update_power(device_id, power.vbus, power.iq, power.power)
 
     @Slot(bool)
     def _on_connection_changed(self, connected: bool) -> None:
@@ -548,5 +610,6 @@ class MainWindow(QMainWindow):
             self.worker.stop()
             self.thread.quit()
             self.thread.wait(2000)
+            self.datalog.close()
         finally:
             super().closeEvent(event)

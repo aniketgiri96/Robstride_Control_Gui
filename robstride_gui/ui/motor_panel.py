@@ -190,11 +190,15 @@ class MotorPanel(QWidget):
         self.read_vel = QLabel("-")
         self.read_tq = QLabel("-")
         self.read_temp = QLabel("-")
+        self.read_volt = QLabel("-")
+        self.read_cur = QLabel("-")
+        self.read_pwr = QLabel("-")
         self.read_fault = QLabel("OK")
         self.read_fault.setStyleSheet("color: #66bb6a;")
         rows = [("Position", self.read_pos), ("Velocity", self.read_vel),
                 ("Torque", self.read_tq), ("Temp", self.read_temp),
-                ("Status", self.read_fault)]
+                ("Voltage", self.read_volt), ("Current", self.read_cur),
+                ("Power", self.read_pwr), ("Status", self.read_fault)]
         for i, (label, w) in enumerate(rows):
             grid.addWidget(QLabel(label), i, 0)
             w.setAlignment(Qt.AlignRight)
@@ -308,3 +312,9 @@ class MotorPanel(QWidget):
             self.read_fault.setStyleSheet("color: #66bb6a;")
         self.plot.add_sample(status.position, status.velocity,
                              status.torque, status.temperature)
+
+    def update_power(self, power) -> None:
+        """Show the board's electrical telemetry (worker.PowerInfo)."""
+        self.read_volt.setText(f"{power.vbus:.2f} V")
+        self.read_cur.setText(f"{power.iq:+.2f} A")
+        self.read_pwr.setText(f"{power.power:+.2f} W")
