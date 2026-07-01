@@ -174,8 +174,36 @@ class RobstrideBus:
         return self._read_status(device_id)
 
     def set_zero(self, device_id: int) -> None:
+        """Set the motor's mechanical zero and persist it to flash.
+
+        SET_ZERO_POSITION (comm 6) only rewrites the motor's *live* (RAM) zero;
+        without a following SAVE_PARAMETERS (comm 22) the new zero is lost on the
+        next power cycle, so the motor "forgets" its absolute position. Saving
+        here - the same pattern as :meth:`set_motor_id` - makes the zero survive
+        a reboot.
+        """
         self._send(proto.build_set_zero(device_id, self.config.host_id))
         time.sleep(0.1)
+        self._send(proto.build_save(device_id, self.config.host_id))
+        time.sleep(0.15)
+
+    def read_zero_state(self, device_id: int) -> Optional[dict]:
+        """Read back the motor's own persisted zero markers.
+
+        Returns ``{"zero_sta": int|None, "mech_offset": float|None}`` - the
+        ``zero_sta`` flag (0x7029) and the stored mechanical zero offset
+        (``mechOffset``, 0x2005) the motor holds in its own registers. This is
+        how the GUI can *show* whether the motor remembers its absolute zero.
+        Returns ``None`` if the motor answers neither read (e.g. powered off).
+        """
+        zero_sta = self.read_param(device_id, ParameterType.ZERO_STATE)
+        mech_offset = self.read_param(device_id, ParameterType.MECHANICAL_OFFSET)
+        if zero_sta is None and mech_offset is None:
+            return None
+        return {
+            "zero_sta": None if zero_sta is None else int(zero_sta),
+            "mech_offset": None if mech_offset is None else float(mech_offset),
+        }
 
     def set_motor_id(self, current_id: int, new_id: int) -> Optional[int]:
         """Reassign a motor's CAN id, persist it, and report where it answers.

@@ -139,6 +139,13 @@ class SetMotorId(Command):
     new_id: int
 
 
+@dataclass
+class ReadZeroState(Command):
+    """Read the motor's own persisted zero markers, to show if it remembers zero."""
+
+    device_id: int
+
+
 # --- board power telemetry ------------------------------------------------------
 
 #: Read VBUS/Iq once every Nth control loop. The control loop runs at 100 Hz; a
@@ -156,6 +163,21 @@ class PowerInfo:
     vbus: float       # bus voltage, V
     iq: float         # filtered q-axis current, A
     power: float      # estimated input power VBUS*Iq, W
+
+
+@dataclass(frozen=True)
+class ZeroStateInfo:
+    """The motor's own persisted zero markers, read back from its registers.
+
+    ``mech_offset`` is the stored mechanical zero (``mechOffset``, 0x2005) the
+    motor keeps in flash; ``zero_sta`` is its zero-state flag (0x7029). Together
+    they show whether the motor remembers its absolute zero. Either field is
+    ``None`` if that register did not answer.
+    """
+
+    device_id: int
+    zero_sta: Optional[int]
+    mech_offset: Optional[float]
 
 
 # --- per-motor live target ------------------------------------------------------
@@ -186,6 +208,7 @@ class ControlWorker(QObject):
     motorEnabledChanged = Signal(int, bool)
     calibrationChanged = Signal(int, int, float)   # device_id, direction, offset
     motorIdChanged = Signal(int, int)              # old_id, new_id
+    zeroStateUpdated = Signal(int, object)         # device_id, ZeroStateInfo
 
     def __init__(self, rate_hz: float = 100.0):
         super().__init__()
@@ -256,7 +279,9 @@ class ControlWorker(QObject):
         elif isinstance(cmd, SetZero):
             if self._bus:
                 self._bus.set_zero(cmd.device_id)
-                self.log.emit(f"M{cmd.device_id}: zero set")
+                self.log.emit(f"M{cmd.device_id}: zero set and saved to flash")
+                # Read the motor's own zero back so the UI confirms it stuck.
+                self._read_zero_state(cmd.device_id)
         elif isinstance(cmd, SetMode):
             self._set_mode(cmd.device_id, cmd.mode)
         elif isinstance(cmd, SetTarget):
@@ -273,6 +298,8 @@ class ControlWorker(QObject):
             self._capture_zero(cmd.device_id)
         elif isinstance(cmd, SetMotorId):
             self._set_motor_id(cmd.current_id, cmd.new_id)
+        elif isinstance(cmd, ReadZeroState):
+            self._read_zero_state(cmd.device_id)
 
     def _connect(self, cmd: Connect) -> None:
         self._bus = RobstrideBus(cmd.transport, BusConfig())
@@ -432,6 +459,19 @@ class ControlWorker(QObject):
         calib.offset = raw
         self.calibrationChanged.emit(device_id, calib.direction, calib.offset)
         self.log.emit(f"M{device_id}: zero captured at {raw:.3f} rad")
+
+    def _read_zero_state(self, device_id: int) -> None:
+        """Read the motor's persisted zero markers and emit them for display."""
+        if not self._bus:
+            return
+        info = self._bus.read_zero_state(device_id)
+        if info is None:
+            self.log.emit(f"M{device_id}: zero state unavailable (no reply)")
+            return
+        self.zeroStateUpdated.emit(
+            device_id, ZeroStateInfo(device_id, info["zero_sta"], info["mech_offset"]))
+        self.log.emit(f"M{device_id}: motor zero_sta={info['zero_sta']}, "
+                      f"mechOffset={info['mech_offset']}")
 
     # -- per-loop servicing ------------------------------------------------------
 

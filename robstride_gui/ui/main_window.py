@@ -11,12 +11,13 @@ from PySide6.QtCore import Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDockWidget, QHBoxLayout, QInputDialog, QLabel,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTabWidget,
-    QVBoxLayout, QWidget,
+    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .. import protocol as proto
 from ..bus import Motor
+from ..calibration_store import CalibrationRecord, CalibrationStore
 from ..datalog import TelemetryLogger
 from ..presets import Preset, PresetStore
 from ..protocol import MotorStatus
@@ -39,6 +40,9 @@ class MainWindow(QMainWindow):
 
         self.panels: dict[int, MotorPanel] = {}
         self.presets = PresetStore().load()
+        # Software zero/direction trim per motor, persisted so a captured zero
+        # survives a GUI restart (the hardware zero is saved to the motor's flash).
+        self.calibrations = CalibrationStore().load()
         # Mirrors the live graph feedback (pos/vel/torque/temp + power) to a
         # separate .txt data file for offline review.
         self.datalog = TelemetryLogger()
@@ -75,6 +79,7 @@ class MainWindow(QMainWindow):
         self.worker.motorEnabledChanged.connect(self._on_motor_enabled)
         self.worker.calibrationChanged.connect(self._on_calibration_changed)
         self.worker.motorIdChanged.connect(self._on_motor_id_changed)
+        self.worker.zeroStateUpdated.connect(self._on_zero_state)
         self.worker.log.connect(self._append_log)
         self.worker.error.connect(self._on_error)
 
@@ -85,7 +90,19 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget()
         root = QVBoxLayout(central)
-        root.addWidget(self._build_connection_bar())
+
+        # The connection bar is a long single row; scroll it horizontally so a
+        # narrow window can still shrink instead of the toolbar forcing a wide
+        # minimum size.
+        bar = self._build_connection_bar()
+        bar_scroll = QScrollArea()
+        bar_scroll.setWidget(bar)
+        bar_scroll.setWidgetResizable(True)
+        bar_scroll.setFrameShape(QScrollArea.NoFrame)
+        bar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        bar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        bar_scroll.setFixedHeight(bar.sizeHint().height() + 16)  # room for scrollbar
+        root.addWidget(bar_scroll)
 
         self.tabs = QTabWidget()
         self.tabs.setMovable(True)
@@ -425,13 +442,20 @@ class MainWindow(QMainWindow):
         panel.zeroRequested.connect(lambda did: self.worker.post(wk.SetZero(did)))
         panel.modeChanged.connect(lambda did, m: self.worker.post(wk.SetMode(did, m)))
         panel.targetChanged.connect(self._on_target_changed)
-        panel.calibrationChanged.connect(
-            lambda did, d, o: self.worker.post(wk.SetCalibration(did, d, o)))
+        panel.calibrationChanged.connect(self._on_panel_calibration_changed)
         panel.captureZeroRequested.connect(
             lambda did: self.worker.post(wk.CaptureZero(did)))
+        panel.zeroStateRequested.connect(
+            lambda did: self.worker.post(wk.ReadZeroState(did)))
         self.panels[device_id] = panel
         self.tabs.addTab(panel, f"Motor {device_id}")
         self.tabs.setCurrentWidget(panel)
+        # Restore this motor's saved software calibration, if any, and push it to
+        # the worker so display and commands use it from the first frame.
+        stored = self.calibrations.get(device_id)
+        if stored is not None:
+            panel.set_calibration_display(stored.direction, stored.offset)
+            self.worker.post(wk.SetCalibration(device_id, stored.direction, stored.offset))
         self._append_log(f"Added motor {device_id} ({model})")
         # A motor added after Connect must be registered with the worker too,
         # else it gets a tab but is never polled/driven (Connect only seeds the
@@ -512,11 +536,29 @@ class MainWindow(QMainWindow):
         if panel is not None:
             panel.set_enabled_state(enabled)
 
+    def _on_panel_calibration_changed(self, device_id: int, direction: int,
+                                      offset: float) -> None:
+        """User edited invert/offset in the panel: push to the worker and persist."""
+        self.worker.post(wk.SetCalibration(device_id, direction, offset))
+        self._persist_calibration(device_id, direction, offset)
+
+    def _persist_calibration(self, device_id: int, direction: int, offset: float) -> None:
+        self.calibrations.upsert(CalibrationRecord(device_id, direction, offset))
+        self.calibrations.save()
+
+    @Slot(int, object)
+    def _on_zero_state(self, device_id: int, info: object) -> None:
+        panel = self.panels.get(device_id)
+        if panel is not None:
+            panel.set_zero_state_display(info)
+
     @Slot(int, int, float)
     def _on_calibration_changed(self, device_id: int, direction: int, offset: float) -> None:
         panel = self.panels.get(device_id)
         if panel is not None:
             panel.set_calibration_display(direction, offset)
+        # e.g. a "set zero here" capture originates in the worker; persist it too.
+        self._persist_calibration(device_id, direction, offset)
 
     @Slot(int, int)
     def _on_motor_id_changed(self, old_id: int, new_id: int) -> None:
@@ -564,7 +606,8 @@ class MainWindow(QMainWindow):
             device_id=panel.device_id,
             mode=panel.mode_combo.currentData(),
             position=panel.pos_spin.value(),
-            velocity=panel.vel_spin.value(),
+            # vel_spin displays RPM; presets store the canonical rad/s value.
+            velocity=panel.vel_spin.value() * proto.RPM_TO_RAD_S,
             current=panel.cur_spin.value(),
             kp=panel.kp_spin.value(),
             kd=panel.kd_spin.value(),
@@ -586,7 +629,7 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             panel.mode_combo.setCurrentIndex(idx)
         panel.pos_spin.setValue(preset.position)
-        panel.vel_spin.setValue(preset.velocity)
+        panel.vel_spin.setValue(preset.velocity * proto.RAD_S_TO_RPM)
         panel.cur_spin.setValue(preset.current)
         panel.kp_spin.setValue(preset.kp)
         panel.kd_spin.setValue(preset.kd)

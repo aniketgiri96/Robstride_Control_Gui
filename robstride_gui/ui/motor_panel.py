@@ -12,7 +12,8 @@ import math
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QPushButton, QScrollArea, QSlider, QSplitter,
+    QVBoxLayout, QWidget,
 )
 
 from .. import protocol as proto
@@ -20,6 +21,12 @@ from ..protocol import MotorStatus, RunMode
 from .plot_panel import LivePlot
 
 _POS_SLIDER_STEPS = 1000  # slider integer resolution across the position span
+
+# Fixed display units: position in radians, velocity in RPM. The motor protocol
+# speaks rad/s on the wire (see protocol.MODEL_VELOCITY_MAX), so velocity is
+# converted only at the display boundary; commands stay in rad/s.
+_RAD_S_TO_RPM = proto.RAD_S_TO_RPM
+_RPM_TO_RAD_S = proto.RPM_TO_RAD_S
 
 
 class MotorPanel(QWidget):
@@ -31,6 +38,7 @@ class MotorPanel(QWidget):
     targetChanged = Signal(int, object)   # device_id, dict of changed fields
     calibrationChanged = Signal(int, int, float)  # device_id, direction, offset
     captureZeroRequested = Signal(int)    # device_id
+    zeroStateRequested = Signal(int)      # device_id
 
     def __init__(self, device_id: int, model: str = proto.DEFAULT_MODEL,
                  parent: QWidget | None = None):
@@ -45,6 +53,7 @@ class MotorPanel(QWidget):
 
     def _build(self) -> None:
         root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
 
         left = QVBoxLayout()
         left.addWidget(self._build_header())
@@ -56,11 +65,38 @@ class MotorPanel(QWidget):
         left.addStretch(1)
         left_w = QWidget()
         left_w.setLayout(left)
-        left_w.setFixedWidth(360)
-        root.addWidget(left_w)
 
-        self.plot = LivePlot()
-        root.addWidget(self.plot, 1)
+        # Scroll the control column so it stays usable on small / short screens
+        # instead of forcing a fixed width and clipping when the window shrinks.
+        controls = QScrollArea()
+        controls.setWidgetResizable(True)
+        controls.setWidget(left_w)
+        controls.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        controls.setMinimumWidth(240)
+
+        self.plot = LivePlot(ranges=self._plot_ranges())
+
+        # A splitter lets the user re-balance controls vs. graph on any device.
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(controls)
+        splitter.addWidget(self.plot)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 820])
+        root.addWidget(splitter)
+
+    def _plot_ranges(self) -> dict[str, tuple[float, float]]:
+        """Fixed Y-axis ranges so the graph scales (and units) stay steady."""
+        lim = self._limits
+        pos = lim["position"]
+        vel_rpm = lim["velocity"] * _RAD_S_TO_RPM
+        tq = lim["torque"]
+        return {
+            "position": (-pos, pos),
+            "velocity": (-vel_rpm, vel_rpm),
+            "torque": (-tq, tq),
+            "temperature": (0.0, 100.0),
+        }
 
     def _build_header(self) -> QWidget:
         box = QGroupBox(f"Motor {self.device_id}  -  {self.model}")
@@ -108,6 +144,20 @@ class MotorPanel(QWidget):
         self.capture_btn.clicked.connect(
             lambda: self.captureZeroRequested.emit(self.device_id))
         form.addRow(self.capture_btn)
+
+        # "Does the motor remember its absolute zero?" - reads the motor's own
+        # stored zero (mechOffset/zero_sta) back from its registers.
+        self.check_zero_btn = QPushButton("Check motor's saved zero")
+        self.check_zero_btn.setToolTip(
+            "Read the motor's own stored zero (mechOffset / zero_sta) to confirm "
+            "it remembers its absolute zero across power cycles.")
+        self.check_zero_btn.clicked.connect(
+            lambda: self.zeroStateRequested.emit(self.device_id))
+        form.addRow(self.check_zero_btn)
+
+        self.zero_state_lbl = QLabel("motor zero: unknown")
+        self.zero_state_lbl.setStyleSheet("color: #9e9e9e;")
+        form.addRow(self.zero_state_lbl)
         return box
 
     def _build_target_box(self) -> QWidget:
@@ -128,10 +178,11 @@ class MotorPanel(QWidget):
         pos_w.setLayout(pos_row)
         form.addRow("Position", pos_w)
 
-        self.vel_spin = self._spin(-self._limits["velocity"], self._limits["velocity"],
-                                   0.05, " rad/s")
+        vmax_rpm = self._limits["velocity"] * _RAD_S_TO_RPM
+        self.vel_spin = self._spin(-vmax_rpm, vmax_rpm, 0.5, " rpm")
         self.vel_spin.valueChanged.connect(
-            lambda v: self.targetChanged.emit(self.device_id, {"velocity": v}))
+            lambda v: self.targetChanged.emit(
+                self.device_id, {"velocity": v * _RPM_TO_RAD_S}))
         form.addRow("Velocity", self.vel_spin)
 
         self.cur_spin = self._spin(-30.0, 30.0, 0.1, " A")
@@ -165,8 +216,9 @@ class MotorPanel(QWidget):
         box = QGroupBox("Jog (rotate)")
         lay = QHBoxLayout(box)
 
-        self.jog_speed_spin = self._spin(0.0, self._limits["velocity"], 0.1, " rad/s")
-        self.jog_speed_spin.setValue(1.0)
+        self.jog_speed_spin = self._spin(
+            0.0, self._limits["velocity"] * _RAD_S_TO_RPM, 1.0, " rpm")
+        self.jog_speed_spin.setValue(10.0)
 
         self.jog_ccw_btn = QPushButton("↺ CCW")
         self.jog_ccw_btn.setToolTip("Hold to rotate counter-clockwise (+velocity)")
@@ -236,6 +288,13 @@ class MotorPanel(QWidget):
         self.invert_check.blockSignals(False)
         self.offset_spin.blockSignals(False)
 
+    def set_zero_state_display(self, info) -> None:
+        """Show the motor's own persisted zero markers (worker.ZeroStateInfo)."""
+        offset = "?" if info.mech_offset is None else f"{info.mech_offset:+.3f} rad"
+        sta = "?" if info.zero_sta is None else str(info.zero_sta)
+        self.zero_state_lbl.setText(f"motor zero: offset {offset} (zero_sta {sta})")
+        self.zero_state_lbl.setStyleSheet("color: #66bb6a;")
+
     def _on_mode_changed(self, _index: int) -> None:
         mode = self.mode_combo.currentData()
         self._update_field_enablement(mode)
@@ -297,7 +356,9 @@ class MotorPanel(QWidget):
     def update_status(self, status: MotorStatus) -> None:
         self.read_pos.setText(
             f"{status.position:+.3f} rad ({math.degrees(status.position):+.1f} deg)")
-        self.read_vel.setText(f"{status.velocity:+.3f} rad/s")
+        self.read_vel.setText(
+            f"{status.velocity * _RAD_S_TO_RPM:+.1f} rpm "
+            f"({status.velocity:+.3f} rad/s)")
         self.read_tq.setText(f"{status.torque:+.3f} Nm")
         self.read_temp.setText(f"{status.temperature:.1f} C")
         if status.has_fault:
@@ -310,7 +371,7 @@ class MotorPanel(QWidget):
         else:
             self.read_fault.setText("OK")
             self.read_fault.setStyleSheet("color: #66bb6a;")
-        self.plot.add_sample(status.position, status.velocity,
+        self.plot.add_sample(status.position, status.velocity * _RAD_S_TO_RPM,
                              status.torque, status.temperature)
 
     def update_power(self, power) -> None:

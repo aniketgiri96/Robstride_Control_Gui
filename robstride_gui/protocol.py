@@ -126,6 +126,12 @@ class ParameterType:
     ZERO_STATE = Param(0x7029, "B", "zero_sta")
 
 
+# --- unit conversions -----------------------------------------------------------
+# Velocity is rad/s everywhere on the wire (MODEL_VELOCITY_MAX, spd_ref). The GUI
+# and recorded telemetry present it in RPM; convert only at those boundaries.
+RAD_S_TO_RPM: Final = 60.0 / (2.0 * math.pi)   # 1 rad/s ≈ 9.5493 rpm
+RPM_TO_RAD_S: Final = (2.0 * math.pi) / 60.0
+
 # --- per-model MIT scaling tables (datasheet ranges) ----------------------------
 
 _4PI = 4 * math.pi

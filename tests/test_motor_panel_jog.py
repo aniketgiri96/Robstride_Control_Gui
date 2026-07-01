@@ -17,7 +17,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from robstride_gui.protocol import RunMode
-from robstride_gui.ui.motor_panel import MotorPanel
+from robstride_gui.ui.motor_panel import _RPM_TO_RAD_S, MotorPanel
 
 
 @pytest.fixture(scope="module")
@@ -40,7 +40,7 @@ def _collect(signal):
 
 
 def test_ccw_jog_commands_positive_velocity(panel):
-    # Arrange
+    # Arrange: jog speed is entered in RPM; the wire command stays in rad/s
     panel.jog_speed_spin.setValue(2.5)
     modes = _collect(panel.modeChanged)
     targets = _collect(panel.targetChanged)
@@ -50,11 +50,11 @@ def test_ccw_jog_commands_positive_velocity(panel):
 
     # Assert: mode switched to velocity and a positive velocity was sent
     assert modes[-1] == (3, RunMode.VELOCITY)
-    assert targets[-1] == (3, {"velocity": 2.5})
+    assert targets[-1] == (3, {"velocity": 2.5 * _RPM_TO_RAD_S})
 
 
 def test_cw_jog_commands_negative_velocity(panel):
-    # Arrange
+    # Arrange: jog speed is entered in RPM; the wire command stays in rad/s
     panel.jog_speed_spin.setValue(2.5)
     targets = _collect(panel.targetChanged)
 
@@ -62,7 +62,7 @@ def test_cw_jog_commands_negative_velocity(panel):
     panel.jog_cw_btn.pressed.emit()
 
     # Assert
-    assert targets[-1] == (3, {"velocity": -2.5})
+    assert targets[-1] == (3, {"velocity": -2.5 * _RPM_TO_RAD_S})
 
 
 def test_releasing_jog_button_stops_motor(panel):

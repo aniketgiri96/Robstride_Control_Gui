@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 TRACES = (
     ("position", "Position (rad)", (0, 200, 255)),
-    ("velocity", "Velocity (rad/s)", (0, 230, 118)),
+    ("velocity", "Velocity (rpm)", (0, 230, 118)),
     ("torque", "Torque (Nm)", (255, 167, 38)),
     ("temperature", "Temp (C)", (239, 83, 80)),
 )
@@ -32,8 +32,10 @@ class LivePlot(QWidget):
     """Stacked rolling plots of position/velocity/torque/temperature."""
 
     def __init__(self, window_seconds: float = 10.0, sample_hz: float = 100.0,
+                 ranges: dict[str, tuple[float, float]] | None = None,
                  parent: QWidget | None = None):
         super().__init__(parent)
+        self._ranges = ranges or {}
         self._maxlen = max(10, int(window_seconds * sample_hz))
         self._t0 = time.monotonic()
         self._t: Deque[float] = collections.deque(maxlen=self._maxlen)
@@ -57,7 +59,19 @@ class LivePlot(QWidget):
             plot.setBackground("#1e1e1e")
             plot.showGrid(x=True, y=True, alpha=0.2)
             plot.setLabel("left", label)
-            plot.setMouseEnabled(x=False, y=True)
+            # Show plain values (e.g. rad, rpm) instead of an auto SI-prefix /
+            # "1e-06" scientific-notation multiplier that hides the real scale.
+            plot.getAxis("left").enableAutoSIPrefix(False)
+            # A fixed Y range keeps each trace's scale steady; without it the
+            # axis auto-rescales on every sample and the units appear to change.
+            fixed = self._ranges.get(key)
+            if fixed is not None:
+                lo, hi = fixed
+                plot.setYRange(lo, hi, padding=0)
+                plot.enableAutoRange(axis="y", enable=False)
+                plot.setMouseEnabled(x=False, y=False)
+            else:
+                plot.setMouseEnabled(x=False, y=True)
             curve = plot.plot(pen=pg.mkPen(color=color, width=2))
             self._curves[key] = curve
             layout.addWidget(plot)

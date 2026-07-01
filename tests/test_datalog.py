@@ -7,6 +7,7 @@ hardware - drive the logger directly against a temp path and read the file back.
 from __future__ import annotations
 
 from robstride_gui.datalog import COLUMNS, TelemetryLogger
+from robstride_gui.protocol import RAD_S_TO_RPM
 
 
 def test_nothing_written_until_start(tmp_path):
@@ -33,7 +34,7 @@ def test_writes_header_and_sample_row(tmp_path):
     cols = lines[1].split("\t")
     assert cols[1] == "1"               # device_id
     assert cols[2] == "0.500000"        # position_rad
-    assert cols[3] == "1.250000"        # velocity_rad_s
+    assert cols[3] == f"{1.25 * RAD_S_TO_RPM:.6f}"  # velocity_rpm (1.25 rad/s)
     assert cols[4] == "0.040000"        # torque_nm
     assert cols[5] == "31.50"           # temperature_c
     assert cols[6] == ""                # vbus blank until a power read arrives

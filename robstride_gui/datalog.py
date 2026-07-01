@@ -24,12 +24,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, TextIO
 
+from .protocol import RAD_S_TO_RPM
+
 #: Tab-separated columns written to the data file, in order.
 COLUMNS = (
     "timestamp",
     "device_id",
     "position_rad",
-    "velocity_rad_s",
+    "velocity_rpm",
     "torque_nm",
     "temperature_c",
     "vbus_v",
@@ -114,7 +116,11 @@ class TelemetryLogger:
     def log_status(self, device_id: int, position: float, velocity: float,
                    torque: float, temperature: float,
                    faults: str = "") -> None:
-        """Append one feedback sample (no-op unless recording)."""
+        """Append one feedback sample (no-op unless recording).
+
+        ``velocity`` is given in rad/s (the wire unit) and is recorded in RPM to
+        match the GUI's fixed display units.
+        """
         if not self._recording or self._fh is None:
             return
         fh = self._fh
@@ -126,7 +132,7 @@ class TelemetryLogger:
             datetime.now().isoformat(timespec="milliseconds"),
             device_id,
             f"{position:.6f}",
-            f"{velocity:.6f}",
+            f"{velocity * RAD_S_TO_RPM:.6f}",
             f"{torque:.6f}",
             f"{temperature:.2f}",
             vbus_s,
