@@ -14,6 +14,7 @@ the decoded feedback.
 
 from __future__ import annotations
 
+import math
 import queue
 import time
 from dataclasses import dataclass, replace
@@ -109,6 +110,24 @@ class SetTarget(Command):
 
 
 @dataclass
+class SetSweep(Command):
+    """Start/stop a continuous position sweep between two angles.
+
+    While enabled the worker overrides the motor's position setpoint every
+    control cycle with a smooth sine that oscillates between ``from_pos`` and
+    ``to_pos`` once per ``period`` seconds - a scripted repeating motion for
+    soak/simulation. Only takes effect in a position run-mode; angles are in
+    radians (user frame), the same units as a normal position setpoint.
+    """
+
+    device_id: int
+    enabled: bool
+    from_pos: float = 0.0
+    to_pos: float = 0.0
+    period: float = 2.0
+
+
+@dataclass
 class EStop(Command):
     engage: bool
 
@@ -143,6 +162,42 @@ class SetMotorId(Command):
 @dataclass
 class ReadZeroState(Command):
     """Read the motor's own persisted zero markers, to show if it remembers zero."""
+
+    device_id: int
+
+
+@dataclass
+class SetRangeLimits(Command):
+    """Set (or clear) a motor's calibrated travel range in the user frame.
+
+    ``pos_min``/``pos_max`` are radians; ``None`` clears that bound. The worker
+    clamps every position-mode setpoint into this range before it reaches the
+    bus, so the motor cannot be driven past the calibrated ends.
+    """
+
+    device_id: int
+    pos_min: Optional[float] = None
+    pos_max: Optional[float] = None
+
+
+@dataclass
+class StartRangeCalibration(Command):
+    """Enter range-calibration for a motor (LeRobot-style).
+
+    While active the worker records the min/max of the live position. With
+    ``make_limp`` the motor is switched to MIT with zero gains/torque so it can
+    be moved by hand; the operator may equally jog it - either way the extremes
+    reached are captured. The prior run-mode/gains are restored on stop.
+    """
+
+    device_id: int
+    make_limp: bool = True
+
+
+@dataclass
+class StopRangeCalibration(Command):
+    """Finish range-calibration: commit the captured min/max as the range and
+    restore the pre-calibration run-mode and gains."""
 
     device_id: int
 
@@ -218,6 +273,14 @@ class MotorTarget:
     kd: float = 6.0
     torque_ff: float = 0.0   # MIT feed-forward torque (Nm); assist/backdrive comp
     enabled: bool = False
+    # Continuous position sweep (soak/simulation): when ``sweep_enabled`` the
+    # loop drives position along a sine between ``sweep_from`` and ``sweep_to``
+    # once per ``sweep_period`` seconds, timed from ``sweep_t0`` (monotonic).
+    sweep_enabled: bool = False
+    sweep_from: float = 0.0
+    sweep_to: float = 0.0
+    sweep_period: float = 2.0
+    sweep_t0: float = 0.0
 
 
 class ControlWorker(QObject):
@@ -233,6 +296,7 @@ class ControlWorker(QObject):
     error = Signal(str)
     motorEnabledChanged = Signal(int, bool)
     calibrationChanged = Signal(int, int, float)   # device_id, direction, offset
+    rangeLimitsChanged = Signal(int, object, object)  # device_id, pos_min, pos_max (rad|None)
     motorIdChanged = Signal(int, int)              # old_id, new_id
     zeroStateUpdated = Signal(int, object)         # device_id, ZeroStateInfo
 
@@ -243,6 +307,13 @@ class ControlWorker(QObject):
         self._bus: Optional[RobstrideBus] = None
         self._targets: dict[int, MotorTarget] = {}
         self._calib: dict[int, Calibration] = {}
+        # Per-motor calibrated travel range in the user frame: (min, max) rad;
+        # either end may be None (uncalibrated -> no clamp on that side).
+        self._range: dict[int, tuple[Optional[float], Optional[float]]] = {}
+        # Live range-calibration capture, keyed by device_id. Each entry holds
+        # the running (min, max) of observed position plus the run-mode/gains to
+        # restore when calibration stops.
+        self._range_cal: dict[int, dict] = {}
         self._last_raw_pos: dict[int, float] = {}
         self._safety = SafetyState(SafetyLimits.for_model(proto.DEFAULT_MODEL))
         self._rate_hz = rate_hz
@@ -314,6 +385,8 @@ class ControlWorker(QObject):
             self._set_mode(cmd.device_id, cmd.mode)
         elif isinstance(cmd, SetTarget):
             self._set_target(cmd)
+        elif isinstance(cmd, SetSweep):
+            self._set_sweep(cmd)
         elif isinstance(cmd, EStop):
             self._estop(cmd.engage)
         elif isinstance(cmd, SetLimits):
@@ -328,6 +401,12 @@ class ControlWorker(QObject):
             self._set_motor_id(cmd.current_id, cmd.new_id)
         elif isinstance(cmd, ReadZeroState):
             self._read_zero_state(cmd.device_id)
+        elif isinstance(cmd, SetRangeLimits):
+            self._set_range_limits(cmd.device_id, cmd.pos_min, cmd.pos_max)
+        elif isinstance(cmd, StartRangeCalibration):
+            self._start_range_calibration(cmd.device_id, cmd.make_limp)
+        elif isinstance(cmd, StopRangeCalibration):
+            self._stop_range_calibration(cmd.device_id)
 
     def _connect(self, cmd: Connect) -> None:
         self._comm_failures = 0
@@ -442,6 +521,35 @@ class ControlWorker(QObject):
         if cmd.torque_ff is not None:
             t.torque_ff = cmd.torque_ff
 
+    def _set_sweep(self, cmd: SetSweep) -> None:
+        t = self._targets.setdefault(cmd.device_id, MotorTarget())
+        t.sweep_from = cmd.from_pos
+        t.sweep_to = cmd.to_pos
+        # Guard the divisor: a zero/negative period would divide by zero in the
+        # sine phase. 50 ms is already far faster than any real motor can track.
+        t.sweep_period = max(float(cmd.period), 0.05)
+        t.sweep_enabled = cmd.enabled
+        if cmd.enabled:
+            t.sweep_t0 = time.monotonic()
+            self.log.emit(
+                f"M{cmd.device_id}: sweep {math.degrees(cmd.from_pos):+.1f} -> "
+                f"{math.degrees(cmd.to_pos):+.1f} deg, period {t.sweep_period:.2f}s")
+        else:
+            # Freeze the setpoint where the sweep left off so the motor holds
+            # instead of jumping back to a stale manual position.
+            t.position = self._sweep_position(t)
+            self.log.emit(f"M{cmd.device_id}: sweep stopped")
+
+    @staticmethod
+    def _sweep_position(t: MotorTarget) -> float:
+        """Sine setpoint for the current time: ``from`` at t0, ``to`` at the
+        half-period, back to ``from`` at the full period. Continuous in velocity
+        (no snap at the endpoints), which is what makes it smooth."""
+        mid = (t.sweep_from + t.sweep_to) / 2.0
+        amp = (t.sweep_to - t.sweep_from) / 2.0
+        phase = (time.monotonic() - t.sweep_t0) / t.sweep_period
+        return mid - amp * math.cos(2.0 * math.pi * phase)
+
     def _estop(self, engage: bool) -> None:
         if engage:
             self._safety.engage_estop()
@@ -477,7 +585,8 @@ class ControlWorker(QObject):
                           "Power-cycle the motor, then Detect.")
             return
         # Follow the motor to the id it actually responds at now.
-        for table in (self._targets, self._calib, self._last_raw_pos):
+        for table in (self._targets, self._calib, self._range,
+                      self._range_cal, self._last_raw_pos):
             if current_id in table:
                 table[live_id] = table.pop(current_id)
         self.motorIdChanged.emit(current_id, live_id)
@@ -495,6 +604,87 @@ class ControlWorker(QObject):
         calib.offset = raw
         self.calibrationChanged.emit(device_id, calib.direction, calib.offset)
         self.log.emit(f"M{device_id}: zero captured at {raw:.3f} rad")
+
+    # -- range calibration -------------------------------------------------------
+
+    def _set_range_limits(self, device_id: int, pos_min: Optional[float],
+                          pos_max: Optional[float]) -> None:
+        """Store a motor's travel range, normalising so min <= max.
+
+        An inverted-direction motor can report the two ends in either order; sort
+        them so the clamp always has a well-formed [lo, hi]. Either end may stay
+        ``None`` to leave that side unbounded.
+        """
+        lo = None if pos_min is None else float(pos_min)
+        hi = None if pos_max is None else float(pos_max)
+        if lo is not None and hi is not None and lo > hi:
+            lo, hi = hi, lo
+        self._range[device_id] = (lo, hi)
+        self.rangeLimitsChanged.emit(device_id, lo, hi)
+        span = ("unbounded" if lo is None and hi is None
+                else f"[{'-inf' if lo is None else f'{lo:.3f}'}, "
+                     f"{'+inf' if hi is None else f'{hi:.3f}'}] rad")
+        self.log.emit(f"M{device_id}: range limits {span}")
+
+    def _start_range_calibration(self, device_id: int, make_limp: bool) -> None:
+        t = self._targets.setdefault(device_id, MotorTarget())
+        state = {"min": None, "max": None, "prev_mode": t.mode,
+                 "prev_kp": t.kp, "prev_kd": t.kd, "prev_tq": t.torque_ff,
+                 "limp": make_limp}
+        # Seed from the current position if we already have feedback, so a motor
+        # sitting still still yields a (degenerate) range rather than nothing.
+        c = self._calib.get(device_id) or Calibration()
+        raw = self._last_raw_pos.get(device_id)
+        if raw is not None:
+            user = c.pos_from_raw(raw)
+            state["min"] = state["max"] = user
+        self._range_cal[device_id] = state
+        if make_limp:
+            # MIT with zero gains/torque = no holding effort, so the shaft can be
+            # moved by hand. Goes through _set_mode so an enabled motor is cleanly
+            # re-armed in the new mode.
+            self._set_mode(device_id, RunMode.MIT)
+            t.kp = 0.0
+            t.kd = 0.0
+            t.torque_ff = 0.0
+        self.log.emit(f"M{device_id}: range calibration started - move the motor "
+                      "through its travel (by hand or jog), then Stop")
+
+    def _stop_range_calibration(self, device_id: int) -> None:
+        state = self._range_cal.pop(device_id, None)
+        if state is None:
+            return
+        t = self._targets.get(device_id)
+        if t is not None and state.get("limp"):
+            # Restore the gains we zeroed, then the run-mode we came from.
+            t.kp = state["prev_kp"]
+            t.kd = state["prev_kd"]
+            t.torque_ff = state["prev_tq"]
+            self._set_mode(device_id, state["prev_mode"])
+        lo, hi = state["min"], state["max"]
+        if lo is None or hi is None:
+            self.log.emit(f"M{device_id}: range calibration stopped - no motion "
+                          "captured (enable the motor and move it), range unchanged")
+            return
+        self._set_range_limits(device_id, lo, hi)
+
+    def _note_range_sample(self, device_id: int, user_pos: float) -> None:
+        """Fold one live position sample into an active calibration's min/max."""
+        state = self._range_cal.get(device_id)
+        if state is None:
+            return
+        if state["min"] is None or user_pos < state["min"]:
+            state["min"] = user_pos
+        if state["max"] is None or user_pos > state["max"]:
+            state["max"] = user_pos
+
+    def _clamp_to_range(self, device_id: int, value: float) -> float:
+        lo, hi = self._range.get(device_id, (None, None))
+        if lo is not None and value < lo:
+            return lo
+        if hi is not None and value > hi:
+            return hi
+        return value
 
     def _read_zero_state(self, device_id: int) -> None:
         """Read the motor's persisted zero markers and emit them for display."""
@@ -605,10 +795,16 @@ class ControlWorker(QObject):
         the user frame for display."""
         s = self._safety
         c = self._calib.get(device_id) or Calibration()
+        # A running sweep drives the position setpoint itself, but only in a
+        # position mode - in velocity/current/MIT the position field is unused,
+        # so leave it alone. Writing t.position keeps the readout/graph honest.
+        if t.sweep_enabled and t.mode in (RunMode.POSITION_PP, RunMode.POSITION_CSP):
+            t.position = self._sweep_position(t)
         if t.mode == RunMode.MIT:
             raw = self._bus.operation(
                 device_id,
-                c.pos_to_raw(s.clamp_position(t.position)),
+                c.pos_to_raw(self._clamp_to_range(
+                    device_id, s.clamp_position(t.position))),
                 c.signed_to_raw(s.clamp_velocity(t.velocity)),
                 s.clamp_kp(t.kp),
                 s.clamp_kd(t.kd),
@@ -617,7 +813,8 @@ class ControlWorker(QObject):
             return self._decalibrate(device_id, raw, c)
         if t.mode in (RunMode.POSITION_PP, RunMode.POSITION_CSP):
             status = self._bus.set_position(
-                device_id, c.pos_to_raw(s.clamp_position(t.position)),
+                device_id, c.pos_to_raw(self._clamp_to_range(
+                    device_id, s.clamp_position(t.position))),
                 s.limits.velocity_max)
         elif t.mode == RunMode.VELOCITY:
             status = self._bus.set_velocity(
@@ -642,9 +839,12 @@ class ControlWorker(QObject):
         if status is None:
             return None
         self._last_raw_pos[device_id] = status.position
+        user_pos = c.pos_from_raw(status.position)
+        # While range-calibrating, every live sample widens the captured min/max.
+        self._note_range_sample(device_id, user_pos)
         return replace(
             status,
-            position=c.pos_from_raw(status.position),
+            position=user_pos,
             velocity=c.signed_from_raw(status.velocity),
             torque=c.signed_from_raw(status.torque),
         )

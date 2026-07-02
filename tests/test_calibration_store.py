@@ -31,6 +31,34 @@ def test_upsert_replaces_same_device(tmp_path):
     assert store.get(1).direction == -1
 
 
+def test_roundtrip_persists_calibrated_range(tmp_path):
+    path = tmp_path / "calibrations.json"
+    store = CalibrationStore(path=path)
+    store.upsert(CalibrationRecord(1, 1, 0.0, pos_min=-1.5, pos_max=2.0))
+    store.save()
+
+    loaded = CalibrationStore(path=path).load()
+
+    assert abs(loaded.get(1).pos_min - (-1.5)) < 1e-9
+    assert abs(loaded.get(1).pos_max - 2.0) < 1e-9
+
+
+def test_range_defaults_to_none_for_legacy_records(tmp_path):
+    # A file written before the range fields existed has no pos_min/pos_max keys;
+    # from_dict must default them to None rather than raise.
+    path = tmp_path / "calibrations.json"
+    path.write_text(
+        '{"version": 1, "calibrations": [{"device_id": 7, "direction": 1, '
+        '"offset": 0.25}]}')
+
+    loaded = CalibrationStore(path=path).load()
+
+    rec = loaded.get(7)
+    assert rec.offset == 0.25
+    assert rec.pos_min is None
+    assert rec.pos_max is None
+
+
 def test_load_missing_file_is_empty(tmp_path):
     store = CalibrationStore(path=tmp_path / "nope.json").load()
     assert store.records == []

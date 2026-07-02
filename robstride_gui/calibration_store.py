@@ -35,6 +35,12 @@ class CalibrationRecord:
     device_id: int
     direction: int = 1     # +1 normal, -1 inverted
     offset: float = 0.0    # rad, raw frame
+    # Calibrated travel range in the *user* frame (rad). ``None`` means that
+    # bound was never calibrated and no software limit is enforced on that side.
+    # Old files that predate these fields load fine: ``from_dict`` drops unknown
+    # keys and these defaults fill the missing ones.
+    pos_min: float | None = None
+    pos_max: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

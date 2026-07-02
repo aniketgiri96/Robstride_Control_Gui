@@ -88,6 +88,7 @@ class MainWindow(QMainWindow):
         self.worker.inventoryReady.connect(self._on_inventory_ready)
         self.worker.motorEnabledChanged.connect(self._on_motor_enabled)
         self.worker.calibrationChanged.connect(self._on_calibration_changed)
+        self.worker.rangeLimitsChanged.connect(self._on_range_limits_changed)
         self.worker.motorIdChanged.connect(self._on_motor_id_changed)
         self.worker.zeroStateUpdated.connect(self._on_zero_state)
         self.worker.log.connect(self._append_log)
@@ -457,6 +458,9 @@ class MainWindow(QMainWindow):
             lambda did: self.worker.post(wk.CaptureZero(did)))
         panel.zeroStateRequested.connect(
             lambda did: self.worker.post(wk.ReadZeroState(did)))
+        panel.rangeCalibrationToggled.connect(self._on_range_calibration_toggled)
+        panel.rangeLimitsEdited.connect(self._on_range_limits_edited)
+        panel.sweepChanged.connect(self._on_sweep_changed)
         self.panels[device_id] = panel
         self.tabs.addTab(panel, f"Motor {device_id}")
         self.tabs.setCurrentWidget(panel)
@@ -466,6 +470,11 @@ class MainWindow(QMainWindow):
         if stored is not None:
             panel.set_calibration_display(stored.direction, stored.offset)
             self.worker.post(wk.SetCalibration(device_id, stored.direction, stored.offset))
+            # Restore the calibrated travel range so inputs and motion are clamped
+            # from the first frame, mirroring the zero/direction restore above.
+            if stored.pos_min is not None or stored.pos_max is not None:
+                panel.set_position_limits(stored.pos_min, stored.pos_max)
+                self.worker.post(wk.SetRangeLimits(device_id, stored.pos_min, stored.pos_max))
         self._append_log(f"Added motor {device_id} ({model})")
         # A motor added after Connect must be registered with the worker too,
         # else it gets a tab but is never polled/driven (Connect only seeds the
@@ -485,6 +494,16 @@ class MainWindow(QMainWindow):
     @Slot(int, object)
     def _on_target_changed(self, device_id: int, changes: dict) -> None:
         self.worker.post(wk.SetTarget(device_id=device_id, **changes))
+
+    @Slot(int, object)
+    def _on_sweep_changed(self, device_id: int, cfg: dict) -> None:
+        if cfg["enabled"] and not self._connected:
+            self._on_error("Connect and enable the motor before starting a sweep")
+            self.panels[device_id].set_sweep_active(False)
+            return
+        self.worker.post(wk.SetSweep(
+            device_id=device_id, enabled=cfg["enabled"],
+            from_pos=cfg["from_pos"], to_pos=cfg["to_pos"], period=cfg["period"]))
 
     # -- worker signal slots -----------------------------------------------------
 
@@ -553,8 +572,44 @@ class MainWindow(QMainWindow):
         self._persist_calibration(device_id, direction, offset)
 
     def _persist_calibration(self, device_id: int, direction: int, offset: float) -> None:
-        self.calibrations.upsert(CalibrationRecord(device_id, direction, offset))
+        # Preserve any calibrated range already stored for this motor: a
+        # zero/direction change must not silently drop the travel limits.
+        prev = self.calibrations.get(device_id)
+        pos_min = prev.pos_min if prev is not None else None
+        pos_max = prev.pos_max if prev is not None else None
+        self.calibrations.upsert(
+            CalibrationRecord(device_id, direction, offset, pos_min, pos_max))
         self.calibrations.save()
+
+    def _persist_range(self, device_id: int, pos_min: float | None,
+                       pos_max: float | None) -> None:
+        # Symmetric to _persist_calibration: keep the existing direction/offset.
+        prev = self.calibrations.get(device_id)
+        direction = prev.direction if prev is not None else 1
+        offset = prev.offset if prev is not None else 0.0
+        self.calibrations.upsert(
+            CalibrationRecord(device_id, direction, offset, pos_min, pos_max))
+        self.calibrations.save()
+
+    def _on_range_calibration_toggled(self, device_id: int, active: bool) -> None:
+        if active and not self._connected:
+            self._on_error("Connect and enable the motor before calibrating its range")
+            self.panels[device_id].range_cal_btn.setChecked(False)
+            return
+        self.worker.post(wk.StartRangeCalibration(device_id) if active
+                         else wk.StopRangeCalibration(device_id))
+
+    def _on_range_limits_edited(self, device_id: int, pos_min, pos_max) -> None:
+        """User applied/cleared limits manually: push to the worker (which
+        normalises and echoes back via rangeLimitsChanged for display+persist)."""
+        self.worker.post(wk.SetRangeLimits(device_id, pos_min, pos_max))
+
+    @Slot(int, object, object)
+    def _on_range_limits_changed(self, device_id: int, pos_min, pos_max) -> None:
+        panel = self.panels.get(device_id)
+        if panel is not None:
+            panel.set_position_limits(pos_min, pos_max)
+        self._persist_range(device_id, pos_min, pos_max)
 
     @Slot(int, object)
     def _on_zero_state(self, device_id: int, info: object) -> None:

@@ -39,6 +39,9 @@ class MotorPanel(QWidget):
     calibrationChanged = Signal(int, int, float)  # device_id, direction, offset
     captureZeroRequested = Signal(int)    # device_id
     zeroStateRequested = Signal(int)      # device_id
+    rangeCalibrationToggled = Signal(int, bool)   # device_id, active
+    rangeLimitsEdited = Signal(int, object, object)  # device_id, min, max (rad|None)
+    sweepChanged = Signal(int, object)    # device_id, dict(enabled, from_pos, to_pos, period)
 
     def __init__(self, device_id: int, model: str = proto.DEFAULT_MODEL,
                  parent: QWidget | None = None):
@@ -47,6 +50,15 @@ class MotorPanel(QWidget):
         self.model = model
         self._limits = proto.model_limits(model)
         self._enabled = False
+        # Active position-input range (rad); defaults to the symmetric model span
+        # and narrows to the calibrated travel once range calibration is applied.
+        span = self._limits["position"]
+        self._pos_lo = -span
+        self._pos_hi = span
+        # Live min/max captured while range calibration is running (rad).
+        self._cal_active = False
+        self._cal_min: float | None = None
+        self._cal_max: float | None = None
         self._build()
 
     # -- construction ------------------------------------------------------------
@@ -61,6 +73,7 @@ class MotorPanel(QWidget):
         left.addWidget(self._build_calibration_box())
         left.addWidget(self._build_target_box())
         left.addWidget(self._build_jog_box())
+        left.addWidget(self._build_sweep_box())
         left.addWidget(self._build_readout_box())
         left.addStretch(1)
         left_w = QWidget()
@@ -158,6 +171,47 @@ class MotorPanel(QWidget):
         self.zero_state_lbl = QLabel("motor zero: unknown")
         self.zero_state_lbl.setStyleSheet("color: #9e9e9e;")
         form.addRow(self.zero_state_lbl)
+
+        form.addRow(self._build_range_calibration())
+        return box
+
+    def _build_range_calibration(self) -> QWidget:
+        """Range (end-stop) calibration: capture the usable travel by moving the
+        motor, then clamp inputs and motion to it - the LeRobot-style workflow."""
+        box = QGroupBox("Range calibration")
+        form = QFormLayout(box)
+
+        self.range_cal_btn = QPushButton("Calibrate range")
+        self.range_cal_btn.setCheckable(True)
+        self.range_cal_btn.setToolTip(
+            "Start, then move the motor through its full travel (by hand once it "
+            "goes limp, or with the jog buttons). Stop to lock the min/max. After "
+            "that the motor cannot be commanded past the calibrated ends.")
+        self.range_cal_btn.toggled.connect(self._on_range_cal_toggled)
+        form.addRow(self.range_cal_btn)
+
+        self.range_captured_lbl = QLabel("captured: -")
+        self.range_captured_lbl.setStyleSheet("color: #9e9e9e;")
+        form.addRow(self.range_captured_lbl)
+
+        # Manual entry / override, in degrees for readability.
+        span_deg = math.degrees(self._limits["position"])
+        self.range_min_spin = self._spin(-span_deg, span_deg, 1.0, " deg")
+        self.range_min_spin.setValue(-span_deg)
+        self.range_max_spin = self._spin(-span_deg, span_deg, 1.0, " deg")
+        self.range_max_spin.setValue(span_deg)
+        form.addRow("Min", self.range_min_spin)
+        form.addRow("Max", self.range_max_spin)
+
+        apply_btn = QPushButton("Apply limits")
+        apply_btn.setToolTip("Use the Min/Max above as the travel range")
+        apply_btn.clicked.connect(self._on_range_apply_clicked)
+        form.addRow(apply_btn)
+
+        clear_btn = QPushButton("Clear limits")
+        clear_btn.setToolTip("Remove the software travel limits (full model span)")
+        clear_btn.clicked.connect(self._on_range_clear_clicked)
+        form.addRow(clear_btn)
         return box
 
     def _build_target_box(self) -> QWidget:
@@ -168,7 +222,9 @@ class MotorPanel(QWidget):
         span = self._limits["position"]
         self.pos_spin = self._spin(-span, span, 0.01, " rad")
         self.pos_slider = QSlider(Qt.Horizontal)
-        self.pos_slider.setRange(-_POS_SLIDER_STEPS, _POS_SLIDER_STEPS)
+        # Integer track 0..steps mapped linearly onto [pos_lo, pos_hi], so an
+        # asymmetric calibrated range maps as cleanly as the default symmetric one.
+        self.pos_slider.setRange(0, _POS_SLIDER_STEPS)
         self.pos_slider.valueChanged.connect(self._on_pos_slider)
         self.pos_spin.valueChanged.connect(self._on_pos_spin)
         pos_row = QVBoxLayout()
@@ -251,6 +307,42 @@ class MotorPanel(QWidget):
         lay.addWidget(self.jog_ccw_btn)
         return box
 
+    def _build_sweep_box(self) -> QWidget:
+        """Continuous position sweep for soak/simulation.
+
+        Oscillates the motor smoothly (sine) between two angles, once per
+        period, until stopped. Angles are entered in degrees for convenience;
+        they are converted to radians at the signal boundary. Starting the
+        sweep forces Position mode so the UI and worker agree.
+        """
+        box = QGroupBox("Sweep / cycle (position)")
+        form = QFormLayout(box)
+
+        span_deg = math.degrees(self._limits["position"])
+        self.sweep_from_spin = self._spin(-span_deg, span_deg, 1.0, " deg")
+        self.sweep_from_spin.setValue(-30.0)
+        self.sweep_to_spin = self._spin(-span_deg, span_deg, 1.0, " deg")
+        self.sweep_to_spin.setValue(30.0)
+        self.sweep_period_spin = self._spin(0.1, 60.0, 0.1, " s")
+        self.sweep_period_spin.setValue(2.0)
+        form.addRow("From", self.sweep_from_spin)
+        form.addRow("To", self.sweep_to_spin)
+        form.addRow("Period", self.sweep_period_spin)
+
+        self.sweep_btn = QPushButton("Start sweep")
+        self.sweep_btn.setCheckable(True)
+        self.sweep_btn.setToolTip(
+            "Oscillate smoothly between the two angles, once per period, until "
+            "stopped. The motor must be enabled. Forces Position mode.")
+        self.sweep_btn.toggled.connect(self._on_sweep_toggled)
+        form.addRow(self.sweep_btn)
+
+        # Live-edit while running: pushing new params keeps the sweep going with
+        # the updated endpoints/period instead of needing a stop/start.
+        for spin in (self.sweep_from_spin, self.sweep_to_spin, self.sweep_period_spin):
+            spin.valueChanged.connect(self._on_sweep_param_changed)
+        return box
+
     def _build_readout_box(self) -> QWidget:
         box = QGroupBox("Feedback")
         grid = QGridLayout(box)
@@ -311,14 +403,71 @@ class MotorPanel(QWidget):
         self.zero_state_lbl.setText(f"motor zero: offset {offset} (zero_sta {sta})")
         self.zero_state_lbl.setStyleSheet("color: #66bb6a;")
 
+    # -- range calibration -------------------------------------------------------
+
+    def _on_range_cal_toggled(self, checked: bool) -> None:
+        self.range_cal_btn.setText("Stop calibration" if checked else "Calibrate range")
+        self._cal_active = checked
+        if checked:
+            self._cal_min = None
+            self._cal_max = None
+            self.range_captured_lbl.setText("captured: move the motor...")
+            self.range_captured_lbl.setStyleSheet("color: #ffa726;")
+        self.rangeCalibrationToggled.emit(self.device_id, checked)
+
+    def _on_range_apply_clicked(self) -> None:
+        lo = math.radians(self.range_min_spin.value())
+        hi = math.radians(self.range_max_spin.value())
+        if lo > hi:
+            lo, hi = hi, lo
+        self.rangeLimitsEdited.emit(self.device_id, lo, hi)
+
+    def _on_range_clear_clicked(self) -> None:
+        self.rangeLimitsEdited.emit(self.device_id, None, None)
+
+    def set_position_limits(self, lo: float | None, hi: float | None) -> None:
+        """Constrain the position input to [lo, hi] (rad); ``None`` on a side
+        falls back to the model span. Rescales the spin/slider and sweep spins so
+        the UI cannot even request a position outside the calibrated travel."""
+        span = self._limits["position"]
+        self._pos_lo = -span if lo is None else lo
+        self._pos_hi = span if hi is None else hi
+        if self._pos_lo > self._pos_hi:
+            self._pos_lo, self._pos_hi = self._pos_hi, self._pos_lo
+
+        # Clamp the current setpoint into the new range, then re-range the spin.
+        self.pos_spin.blockSignals(True)
+        self.pos_spin.setRange(self._pos_lo, self._pos_hi)
+        self.pos_spin.blockSignals(False)
+        # Reflect the range in the sweep endpoints too (entered in degrees).
+        lo_deg, hi_deg = math.degrees(self._pos_lo), math.degrees(self._pos_hi)
+        for spin in (self.sweep_from_spin, self.sweep_to_spin):
+            spin.blockSignals(True)
+            spin.setRange(lo_deg, hi_deg)
+            spin.blockSignals(False)
+        # And the manual min/max entry boxes, without re-emitting.
+        for spin, val in ((self.range_min_spin, lo_deg), (self.range_max_spin, hi_deg)):
+            spin.blockSignals(True)
+            spin.setValue(val)
+            spin.blockSignals(False)
+        # Re-sync the slider to the (possibly clamped) spin value.
+        self._on_pos_spin(self.pos_spin.value())
+
+        bounded = lo is not None or hi is not None
+        self.range_captured_lbl.setText(
+            f"range: [{lo_deg:+.1f}, {hi_deg:+.1f}] deg" if bounded
+            else "range: full model span (uncalibrated)")
+        self.range_captured_lbl.setStyleSheet(
+            "color: #66bb6a;" if bounded else "color: #9e9e9e;")
+
     def _on_mode_changed(self, _index: int) -> None:
         mode = self.mode_combo.currentData()
         self._update_field_enablement(mode)
         self.modeChanged.emit(self.device_id, mode)
 
     def _on_pos_slider(self, value: int) -> None:
-        span = self._limits["position"]
-        rad = (value / _POS_SLIDER_STEPS) * span
+        span = self._pos_hi - self._pos_lo
+        rad = self._pos_lo + (value / _POS_SLIDER_STEPS) * span
         if abs(rad - self.pos_spin.value()) > 1e-6:
             self.pos_spin.blockSignals(True)
             self.pos_spin.setValue(rad)
@@ -326,8 +475,9 @@ class MotorPanel(QWidget):
         self.targetChanged.emit(self.device_id, {"position": rad})
 
     def _on_pos_spin(self, value: float) -> None:
-        span = self._limits["position"]
-        slider_val = int((value / span) * _POS_SLIDER_STEPS) if span else 0
+        span = self._pos_hi - self._pos_lo
+        slider_val = int(round((value - self._pos_lo) / span * _POS_SLIDER_STEPS)) if span else 0
+        slider_val = max(0, min(_POS_SLIDER_STEPS, slider_val))
         if slider_val != self.pos_slider.value():
             self.pos_slider.blockSignals(True)
             self.pos_slider.setValue(slider_val)
@@ -363,6 +513,29 @@ class MotorPanel(QWidget):
     def _stop_jog(self) -> None:
         self.vel_spin.setValue(0.0)
 
+    def _on_sweep_toggled(self, checked: bool) -> None:
+        self.sweep_btn.setText("Stop sweep" if checked else "Start sweep")
+        if checked:
+            # Force Position mode so the sweep setpoint is actually acted on
+            # (the worker only sweeps in a position run-mode).
+            idx = self.mode_combo.findData(RunMode.POSITION_PP)
+            if idx >= 0 and self.mode_combo.currentIndex() != idx:
+                self.mode_combo.setCurrentIndex(idx)  # emits modeChanged
+        self._emit_sweep()
+
+    def _on_sweep_param_changed(self, *_args) -> None:
+        # Only push mid-run edits; idle edits just stage the next Start.
+        if self.sweep_btn.isChecked():
+            self._emit_sweep()
+
+    def _emit_sweep(self) -> None:
+        self.sweepChanged.emit(self.device_id, {
+            "enabled": self.sweep_btn.isChecked(),
+            "from_pos": math.radians(self.sweep_from_spin.value()),
+            "to_pos": math.radians(self.sweep_to_spin.value()),
+            "period": self.sweep_period_spin.value(),
+        })
+
     def _update_field_enablement(self, mode: int) -> None:
         is_pos = mode in (RunMode.POSITION_PP, RunMode.POSITION_CSP, RunMode.MIT)
         is_vel = mode in (RunMode.VELOCITY, RunMode.MIT)
@@ -379,6 +552,14 @@ class MotorPanel(QWidget):
 
     # -- external updates --------------------------------------------------------
 
+    def set_sweep_active(self, active: bool) -> None:
+        """Reflect sweep on/off from outside (e.g. a rejected start) without
+        re-emitting sweepChanged."""
+        self.sweep_btn.blockSignals(True)
+        self.sweep_btn.setChecked(active)
+        self.sweep_btn.setText("Stop sweep" if active else "Start sweep")
+        self.sweep_btn.blockSignals(False)
+
     def set_enabled_state(self, enabled: bool) -> None:
         self._enabled = enabled
         self.enable_btn.blockSignals(True)
@@ -390,6 +571,8 @@ class MotorPanel(QWidget):
             else "color: #b71c1c; font-size: 18px;")
 
     def update_status(self, status: MotorStatus) -> None:
+        if self._cal_active:
+            self._fold_calibration_sample(status.position)
         self.read_pos.setText(
             f"{status.position:+.3f} rad ({math.degrees(status.position):+.1f} deg)")
         self.read_vel.setText(
@@ -409,6 +592,15 @@ class MotorPanel(QWidget):
             self.read_fault.setStyleSheet("color: #66bb6a;")
         self.plot.add_sample(status.position, status.velocity * _RAD_S_TO_RPM,
                              status.torque, status.temperature)
+
+    def _fold_calibration_sample(self, pos: float) -> None:
+        """Track the live min/max while range calibration is running (display
+        only; the worker computes the authoritative bounds it commits on stop)."""
+        self._cal_min = pos if self._cal_min is None else min(self._cal_min, pos)
+        self._cal_max = pos if self._cal_max is None else max(self._cal_max, pos)
+        self.range_captured_lbl.setText(
+            f"captured: [{math.degrees(self._cal_min):+.1f}, "
+            f"{math.degrees(self._cal_max):+.1f}] deg")
 
     def update_power(self, power) -> None:
         """Show the board's electrical telemetry (worker.PowerInfo)."""
