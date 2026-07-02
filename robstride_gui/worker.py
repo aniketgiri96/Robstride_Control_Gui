@@ -105,6 +105,7 @@ class SetTarget(Command):
     current: Optional[float] = None
     kp: Optional[float] = None
     kd: Optional[float] = None
+    torque_ff: Optional[float] = None
 
 
 @dataclass
@@ -155,6 +156,30 @@ class ReadZeroState(Command):
 POWER_READ_DIVISOR: int = 20
 
 
+# --- communication watchdog ------------------------------------------------------
+
+#: Consecutive transport-level failures in the control loop before the worker
+#: declares the link dead and disconnects. At the 100 Hz loop rate this is
+#: ~0.1 s of solid failure - long enough to ride out a one-off USB glitch (the
+#: transport already retries transient CH340 hiccups internally), short enough
+#: that a yanked adapter does not leave enabled motors unsupervised for long.
+COMM_FAILURE_LIMIT: int = 10
+
+#: Motor-side watchdog, written to the ``canTimeout`` register (0x7028) on
+#: every Enable. A host-side watchdog cannot help when the *host* dies (process
+#: crash, cable pull): in velocity/current mode the motor would keep executing
+#: its last setpoint forever. With canTimeout armed the motor stops itself when
+#: no frame arrives within the window. The worker refreshes setpoints every
+#: 10 ms, so 1000 ms has a wide safety margin against false trips. Set the
+#: worker's ``motor_can_timeout_ms`` to 0 to skip the write.
+#:
+#: NOTE: the millisecond unit is assumed from the register spec but has not
+#: been verified on this hardware. On first use, enable a motor, stop sending
+#: (unplug the adapter) and confirm it actually stops after ~1 s: much sooner
+#: or never means the firmware interprets the value differently - adjust here.
+MOTOR_CAN_TIMEOUT_MS: int = 1000
+
+
 @dataclass(frozen=True)
 class PowerInfo:
     """Electrical telemetry read from the motor control board."""
@@ -191,6 +216,7 @@ class MotorTarget:
     current: float = 0.0
     kp: float = 28.0
     kd: float = 6.0
+    torque_ff: float = 0.0   # MIT feed-forward torque (Nm); assist/backdrive comp
     enabled: bool = False
 
 
@@ -221,6 +247,8 @@ class ControlWorker(QObject):
         self._safety = SafetyState(SafetyLimits.for_model(proto.DEFAULT_MODEL))
         self._rate_hz = rate_hz
         self._loop_count = 0
+        self._comm_failures = 0
+        self.motor_can_timeout_ms = MOTOR_CAN_TIMEOUT_MS
 
     # -- public, thread-safe API (called from the GUI thread) --------------------
 
@@ -302,6 +330,7 @@ class ControlWorker(QObject):
             self._read_zero_state(cmd.device_id)
 
     def _connect(self, cmd: Connect) -> None:
+        self._comm_failures = 0
         self._bus = RobstrideBus(cmd.transport, BusConfig())
         for m in cmd.motors:
             self._bus.add_motor(m)
@@ -330,6 +359,7 @@ class ControlWorker(QObject):
             except Exception:
                 pass
             self._bus = None
+            self._comm_failures = 0
             self.connectionChanged.emit(False)
             self.log.emit("Disconnected")
 
@@ -363,6 +393,7 @@ class ControlWorker(QObject):
         # across power cycles, so without this it may sit in MIT mode and ignore
         # every position/velocity/current setpoint we send.
         self._bus.set_run_mode(device_id, target.mode)
+        self._configure_motor_watchdog(device_id)
         self._bus.enable(device_id)
         target.enabled = True
         self.motorEnabledChanged.emit(device_id, True)
@@ -390,6 +421,9 @@ class ControlWorker(QObject):
         self._bus.set_run_mode(device_id, mode)
         target.mode = mode
         if was_enabled:
+            # Re-arm the motor-side watchdog too: this disable/enable pulse is
+            # a full enable, and firmware may not keep canTimeout across it.
+            self._configure_motor_watchdog(device_id)
             self._bus.enable(device_id)
         self.log.emit(f"M{device_id}: mode -> {RunMode.NAMES.get(mode, mode)}")
 
@@ -405,6 +439,8 @@ class ControlWorker(QObject):
             t.kp = cmd.kp
         if cmd.kd is not None:
             t.kd = cmd.kd
+        if cmd.torque_ff is not None:
+            t.torque_ff = cmd.torque_ff
 
     def _estop(self, engage: bool) -> None:
         if engage:
@@ -473,22 +509,73 @@ class ControlWorker(QObject):
         self.log.emit(f"M{device_id}: motor zero_sta={info['zero_sta']}, "
                       f"mechOffset={info['mech_offset']}")
 
+    def _configure_motor_watchdog(self, device_id: int) -> None:
+        """Arm the motor's own CAN watchdog before enabling it.
+
+        Writes ``motor_can_timeout_ms`` to the canTimeout register (0x7028) so
+        the motor stops itself if the host goes silent - the failure a
+        host-side watchdog cannot cover. Best-effort: a motor that does not
+        ack the write still enables, but the gap is logged so the operator
+        knows the safety net is missing.
+        """
+        timeout_ms = int(self.motor_can_timeout_ms)
+        if timeout_ms <= 0:
+            return
+        ack = self._bus.write_param(device_id, ParameterType.CAN_TIMEOUT, timeout_ms)
+        if ack is None:
+            # error (not just log): an unarmed motor-side watchdog is the most
+            # safety-relevant gap here - the motor will NOT stop on its own if
+            # the link to the host drops. The operator must see this.
+            self.error.emit(
+                f"M{device_id}: canTimeout write not acked - the motor will "
+                "NOT stop on its own if the link to the host drops")
+
+    # -- host-side communication watchdog -----------------------------------------
+
+    def _note_comm_failure(self, message: str) -> None:
+        """Count a transport-level failure; disconnect once the limit is hit.
+
+        Only the first failure of a burst is surfaced (the UI would otherwise
+        get one error per motor per 100 Hz cycle). Reaching
+        :data:`COMM_FAILURE_LIMIT` consecutive failures means the link is dead,
+        not glitching: tear down instead of spinning on it while enabled motors
+        run unsupervised - their own canTimeout watchdog stops them.
+        """
+        self._comm_failures += 1
+        if self._comm_failures == 1:
+            self.error.emit(message)
+        elif self._comm_failures >= COMM_FAILURE_LIMIT:
+            self.error.emit(
+                f"Connection lost: {self._comm_failures} consecutive bus "
+                f"failures (last: {message}). Disconnecting - enabled motors "
+                "stop via their canTimeout watchdog.")
+            self._teardown()
+
     # -- per-loop servicing ------------------------------------------------------
 
     def _service_motors(self) -> None:
         read_power = self._loop_count % POWER_READ_DIVISOR == 0
+        # The failure counter may only reset after a *fully clean* pass. If it
+        # were reset on any motor's success, one healthy motor would clear the
+        # count that a dead one keeps accruing in the same cycle, and the
+        # watchdog could never trip (nor its error dedup engage).
+        failures_before = self._comm_failures
         for device_id, target in list(self._targets.items()):
+            if self._bus is None:
+                return  # the watchdog tore the connection down mid-iteration
             if not target.enabled or self._safety.estop:
                 continue
             try:
                 status = self._command_motor(device_id, target)
             except TransportError as e:
-                self.error.emit(str(e))
+                self._note_comm_failure(str(e))
                 continue
             if status is not None:
                 self.statusUpdated.emit(device_id, status)
             if read_power:
                 self._read_power(device_id)
+        if self._bus is not None and self._comm_failures == failures_before:
+            self._comm_failures = 0  # clean pass: the link is healthy again
 
     def _read_power(self, device_id: int) -> None:
         """Read the board's bus voltage and current and emit derived power.
@@ -498,11 +585,13 @@ class ControlWorker(QObject):
         motor. Done at ~5 Hz via :data:`POWER_READ_DIVISOR` to keep them off the
         hot path. A non-responding read leaves the value out and emits nothing.
         """
+        if self._bus is None:
+            return
         try:
             vbus = self._bus.read_param(device_id, ParameterType.VBUS)
             iq = self._bus.read_param(device_id, ParameterType.IQ_FILTERED)
         except TransportError as e:
-            self.error.emit(str(e))
+            self._note_comm_failure(str(e))
             return
         if vbus is None or iq is None:
             return
@@ -523,7 +612,7 @@ class ControlWorker(QObject):
                 c.signed_to_raw(s.clamp_velocity(t.velocity)),
                 s.clamp_kp(t.kp),
                 s.clamp_kd(t.kd),
-                0.0,
+                s.clamp_torque(t.torque_ff),
             )
             return self._decalibrate(device_id, raw, c)
         if t.mode in (RunMode.POSITION_PP, RunMode.POSITION_CSP):

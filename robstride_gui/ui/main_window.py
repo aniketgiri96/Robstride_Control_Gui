@@ -7,6 +7,8 @@ worker and *reacts to signals* from it - it never performs IO itself.
 
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -31,6 +33,11 @@ from .motor_panel import MotorPanel
 
 PLOT_REFRESH_MS = 33  # ~30 FPS
 
+#: Minimum seconds between error *popups*. Every error still reaches the log;
+#: only the modal dialog is throttled, so a failing bus (one error per motor
+#: per control cycle) cannot stack hundreds of dialogs and freeze the UI.
+ERROR_DIALOG_MIN_INTERVAL_S = 3.0
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -51,6 +58,9 @@ class MainWindow(QMainWindow):
         # Remembers whether the window was maximized before entering fullscreen
         # so leaving fullscreen restores that state instead of a small window.
         self._was_maximized = False
+        # When the last error popup was shown (monotonic); -inf so the first
+        # error always gets a dialog.
+        self._last_error_dialog_time = float("-inf")
 
         self._start_worker()
         self._build_ui()
@@ -570,6 +580,14 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_error(self, message: str) -> None:
         self._append_log("ERROR: " + message)
+        # Rate-limit the modal popup: during a bus failure the worker can emit
+        # errors far faster than a user can dismiss dialogs, and each unclosed
+        # QMessageBox blocks the one behind it. The log above keeps the full
+        # history; the dialog is just the attention-getter.
+        now = time.monotonic()
+        if now - self._last_error_dialog_time < ERROR_DIALOG_MIN_INTERVAL_S:
+            return
+        self._last_error_dialog_time = now
         QMessageBox.warning(self, "RobStride Control", message)
 
     def _append_log(self, message: str) -> None:

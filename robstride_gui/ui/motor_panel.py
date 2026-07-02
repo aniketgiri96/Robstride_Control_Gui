@@ -202,6 +202,22 @@ class MotorPanel(QWidget):
             lambda v: self.targetChanged.emit(self.device_id, {"kd": v}))
         form.addRow("Kd", self.kd_spin)
 
+        # Assist / feed-forward torque (MIT only). Injects a constant torque so a
+        # geared motor can be made to *feel* backdrivable at Kp=Kd=0; safety caps
+        # it at torque_max regardless of the slider range.
+        tq = self._limits["torque"]
+        self.tq_spin = self._spin(-tq, tq, 0.1, " Nm")
+        self.tq_slider = QSlider(Qt.Horizontal)
+        self.tq_slider.setRange(-_POS_SLIDER_STEPS, _POS_SLIDER_STEPS)
+        self.tq_slider.valueChanged.connect(self._on_tq_slider)
+        self.tq_spin.valueChanged.connect(self._on_tq_spin)
+        tq_row = QVBoxLayout()
+        tq_row.addWidget(self.tq_spin)
+        tq_row.addWidget(self.tq_slider)
+        tq_w = QWidget()
+        tq_w.setLayout(tq_row)
+        form.addRow("Assist τ", tq_w)
+
         self._update_field_enablement(RunMode.POSITION_PP)
         return box
 
@@ -318,6 +334,24 @@ class MotorPanel(QWidget):
             self.pos_slider.blockSignals(False)
         self.targetChanged.emit(self.device_id, {"position": value})
 
+    def _on_tq_slider(self, value: int) -> None:
+        span = self._limits["torque"]
+        nm = (value / _POS_SLIDER_STEPS) * span
+        if abs(nm - self.tq_spin.value()) > 1e-6:
+            self.tq_spin.blockSignals(True)
+            self.tq_spin.setValue(nm)
+            self.tq_spin.blockSignals(False)
+        self.targetChanged.emit(self.device_id, {"torque_ff": nm})
+
+    def _on_tq_spin(self, value: float) -> None:
+        span = self._limits["torque"]
+        slider_val = int((value / span) * _POS_SLIDER_STEPS) if span else 0
+        if slider_val != self.tq_slider.value():
+            self.tq_slider.blockSignals(True)
+            self.tq_slider.setValue(slider_val)
+            self.tq_slider.blockSignals(False)
+        self.targetChanged.emit(self.device_id, {"torque_ff": value})
+
     def _start_jog(self, sign: int) -> None:
         """Switch to velocity mode (so UI and worker stay in sync) and drive
         the motor at the jog speed in the requested direction."""
@@ -340,6 +374,8 @@ class MotorPanel(QWidget):
         self.cur_spin.setEnabled(is_cur)
         self.kp_spin.setEnabled(is_mit)
         self.kd_spin.setEnabled(is_mit)
+        self.tq_spin.setEnabled(is_mit)
+        self.tq_slider.setEnabled(is_mit)
 
     # -- external updates --------------------------------------------------------
 
