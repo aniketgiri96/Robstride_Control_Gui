@@ -54,6 +54,11 @@ class MainWindow(QMainWindow):
         # separate .txt data file for offline review.
         self.datalog = TelemetryLogger()
         self._connected = False
+        # Motors whose zero was (re)set since their last enable. The next enable
+        # for these asks for confirmation: a fresh zero moves the reference
+        # frame, so "hold current position" is safe but the operator should
+        # still eyeball the rig before energising it.
+        self._zeroed_since_enable: set[int] = set()
         self.device_dialog: DeviceDialog | None = None
         # Remembers whether the window was maximized before entering fullscreen
         # so leaving fullscreen restores that state instead of a small window.
@@ -90,6 +95,7 @@ class MainWindow(QMainWindow):
         self.worker.calibrationChanged.connect(self._on_calibration_changed)
         self.worker.rangeLimitsChanged.connect(self._on_range_limits_changed)
         self.worker.motorIdChanged.connect(self._on_motor_id_changed)
+        self.worker.sweepStopped.connect(self._on_sweep_stopped)
         self.worker.zeroStateUpdated.connect(self._on_zero_state)
         self.worker.log.connect(self._append_log)
         self.worker.error.connect(self._on_error)
@@ -450,7 +456,7 @@ class MainWindow(QMainWindow):
             return self.panels[device_id]
         panel = MotorPanel(device_id, model)
         panel.enableToggled.connect(self._on_enable_toggled)
-        panel.zeroRequested.connect(lambda did: self.worker.post(wk.SetZero(did)))
+        panel.zeroRequested.connect(self._on_zero_requested)
         panel.modeChanged.connect(lambda did, m: self.worker.post(wk.SetMode(did, m)))
         panel.targetChanged.connect(self._on_target_changed)
         panel.calibrationChanged.connect(self._on_panel_calibration_changed)
@@ -484,12 +490,40 @@ class MainWindow(QMainWindow):
         return panel
 
     @Slot(int, bool)
+    def _on_zero_requested(self, device_id: int) -> None:
+        self.worker.post(wk.SetZero(device_id))
+        # Arm the one-shot enable confirmation for this motor.
+        self._zeroed_since_enable.add(device_id)
+
     def _on_enable_toggled(self, device_id: int, enable: bool) -> None:
         if not self._connected:
             self._on_error("Connect to the bus before enabling a motor")
             self.panels[device_id].set_enabled_state(False)
             return
+        if enable and device_id in self._zeroed_since_enable:
+            if not self._confirm_enable_after_zero(device_id):
+                # Operator backed out: leave the motor disabled and the button
+                # un-toggled, and keep the flag armed for the next attempt.
+                self.panels[device_id].set_enabled_state(False)
+                return
+            self._zeroed_since_enable.discard(device_id)
         self.worker.post(wk.Enable(device_id) if enable else wk.Disable(device_id))
+
+    def _confirm_enable_after_zero(self, device_id: int) -> bool:
+        confirm = QMessageBox.question(
+            self, "Enable motor",
+            f"Motor {device_id} was zeroed since it was last enabled.\n\n"
+            "It will come up HOLDING its current position, but check the rig is "
+            "clear before energising it. Enable now?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return confirm == QMessageBox.Yes
+
+    def _on_sweep_stopped(self, device_id: int) -> None:
+        # The worker auto-stopped a sweep (disable / E-stop / range cutout);
+        # reflect it so the button doesn't show a phantom "Stop sweep".
+        panel = self.panels.get(device_id)
+        if panel is not None:
+            panel.set_sweep_active(False)
 
     @Slot(int, object)
     def _on_target_changed(self, device_id: int, changes: dict) -> None:

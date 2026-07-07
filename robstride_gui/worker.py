@@ -28,6 +28,17 @@ from .protocol import MotorStatus, ParameterType, RunMode
 from .safety import Calibration, SafetyLimits, SafetyState
 from .transport import Transport, TransportError
 
+# Run modes that hold a position setpoint. Enabling one must first seed the
+# setpoint to the shaft's current position, or the motor snaps to a stale
+# target (see ``ControlWorker._seed_hold_position``).
+_POSITION_MODES = (RunMode.POSITION_PP, RunMode.POSITION_CSP)
+
+# How far live feedback may exceed the calibrated range before the safety cutout
+# disables the motor. A few degrees of slack absorbs position-hold jitter and
+# brief overshoot without nuisance trips, while still stopping a runaway before
+# it drives an attached part through a hard stop.
+RANGE_TRIP_MARGIN_RAD = math.radians(5.0)
+
 
 # --- command objects pushed from the UI -----------------------------------------
 
@@ -299,6 +310,7 @@ class ControlWorker(QObject):
     rangeLimitsChanged = Signal(int, object, object)  # device_id, pos_min, pos_max (rad|None)
     motorIdChanged = Signal(int, int)              # old_id, new_id
     zeroStateUpdated = Signal(int, object)         # device_id, ZeroStateInfo
+    sweepStopped = Signal(int)                     # device_id: sweep auto-stopped
 
     def __init__(self, rate_hz: float = 100.0):
         super().__init__()
@@ -376,11 +388,7 @@ class ControlWorker(QObject):
         elif isinstance(cmd, Disable):
             self._disable(cmd.device_id)
         elif isinstance(cmd, SetZero):
-            if self._bus:
-                self._bus.set_zero(cmd.device_id)
-                self.log.emit(f"M{cmd.device_id}: zero set and saved to flash")
-                # Read the motor's own zero back so the UI confirms it stuck.
-                self._read_zero_state(cmd.device_id)
+            self._set_zero(cmd.device_id)
         elif isinstance(cmd, SetMode):
             self._set_mode(cmd.device_id, cmd.mode)
         elif isinstance(cmd, SetTarget):
@@ -468,24 +476,139 @@ class ControlWorker(QObject):
         if not self._bus:
             return
         target = self._targets.setdefault(device_id, MotorTarget())
+        # Hard safety latch: never energise a motor while E-STOP is engaged. The
+        # control loop already skips commanding an estopped motor, but enabling
+        # still applies holding torque - the operator expects a dead motor.
+        if self._safety.estop:
+            self.error.emit(
+                f"M{device_id}: E-STOP engaged - clear it before enabling")
+            self.motorEnabledChanged.emit(device_id, False)
+            return
         # Assert the run-mode before enabling: the motor keeps its previous mode
         # across power cycles, so without this it may sit in MIT mode and ignore
         # every position/velocity/current setpoint we send.
         self._bus.set_run_mode(device_id, target.mode)
+        # Safe-enable: seed the setpoint to the shaft's *current* position so the
+        # motor comes up HOLDING where it is. Without this it snaps to the last
+        # (default 0.0) position target the instant it is enabled, which can slam
+        # attached hardware into its surroundings. Only position/MIT modes hold a
+        # position; velocity/current default to 0 (no motion) and need no seed.
+        if target.mode in _POSITION_MODES or target.mode == RunMode.MIT:
+            self._seed_hold_position(device_id, target)
         self._configure_motor_watchdog(device_id)
         self._bus.enable(device_id)
         target.enabled = True
+        # Re-assert the hold setpoint AFTER enabling. The pre-enable seed above is
+        # a belt-and-suspenders: RobStride ignores a loc_ref (POSITION_TARGET)
+        # write while the motor is disabled, so on its own it keeps the internal
+        # target from the *previous* enable and profiles straight back to that old
+        # angle the instant it is energised (the "jumps to the last position, not
+        # the new zero" bug - most visible after a Set Zero at a hand-moved spot).
+        # Writing loc_ref once more here, now that the motor accepts it, pins the
+        # hold to the shaft's current spot and closes the window before the first
+        # control-loop tick.
+        if target.mode in _POSITION_MODES:
+            raw = self._last_raw_pos.get(device_id)
+            if raw is not None:
+                self._bus.set_position(device_id, raw, self._safety.limits.velocity_max)
         self.motorEnabledChanged.emit(device_id, True)
         self.log.emit(f"M{device_id}: enabled (mode {RunMode.NAMES.get(target.mode, target.mode)})")
+
+    def _seed_hold_position(self, device_id: int, target: MotorTarget) -> None:
+        """Make the shaft's current position the hold setpoint before enabling.
+
+        The reading comes from ``poll_status`` so it is in the SAME frame as the
+        live feedback and the motor's mechanical zero. A plain ``mechPos`` param
+        read can lag a just-applied Set Zero: it would seed the setpoint in the
+        old frame and swing the shaft back to its pre-zero position on enable.
+        The motor is always disabled at this point, so the zero-gain status frame
+        commands no motion. For profiled/CSP modes we also pre-load ``loc_ref``
+        so the first hold is the current spot. A failed read is surfaced loudly:
+        enabling blind risks the jump this guards against.
+        """
+        status = self._bus.poll_status(device_id)
+        if status is None:
+            self.error.emit(
+                f"M{device_id}: could not read position before enable - the "
+                "motor may jump to its last target. Check the connection.")
+            return
+        raw = float(status.position)
+        c = self._calib.get(device_id) or Calibration()
+        self._last_raw_pos[device_id] = raw
+        target.position = c.pos_from_raw(raw)
+        if target.mode in _POSITION_MODES:
+            self._bus.set_position(device_id, raw, self._safety.limits.velocity_max)
 
     def _disable(self, device_id: int) -> None:
         if not self._bus:
             return
         self._bus.disable(device_id)
-        if device_id in self._targets:
-            self._targets[device_id].enabled = False
+        target = self._targets.get(device_id)
+        if target is not None:
+            target.enabled = False
+            # Stop any sweep so the next enable holds position instead of
+            # resuming the trajectory - that would defeat safe-enable.
+            self._stop_sweep(device_id, target)
         self.motorEnabledChanged.emit(device_id, False)
         self.log.emit(f"M{device_id}: disabled")
+
+    def _set_zero(self, device_id: int) -> None:
+        """Rewrite the motor's mechanical zero at the current spot and persist it.
+
+        SET_ZERO_POSITION is meant for a *stopped* motor: issuing it while a
+        position loop is actively holding shifts the encoder frame out from under
+        the setpoint, so the shaft twitches, and the ~0.25 s save (see
+        ``RobstrideBus.set_zero``) freezes the readout mid-move - the operator
+        sees the feedback wander instead of snapping to 0. So if the motor is
+        enabled we disable it around the zero, then re-seed the hold at the new
+        zero and re-enable: the shaft stays put and the readout lands cleanly on
+        0. If it was already disabled this is a plain zero with no motion.
+        """
+        if self._bus is None:
+            return
+        target = self._targets.get(device_id)
+        was_enabled = target is not None and target.enabled
+        # Stop the active position loop before redefining its reference frame.
+        if was_enabled:
+            self._disable(device_id)
+        self._bus.set_zero(device_id)
+        self.log.emit(f"M{device_id}: zero set and saved to flash")
+        # A hardware zero remakes the motor's mechanical frame at the current
+        # spot. Any software offset would now double-count, so the readout would
+        # show -offset instead of 0. Clear it (keep the direction/invert) so the
+        # two frames agree; the change is persisted via calibrationChanged.
+        calib = self._calib.setdefault(device_id, Calibration())
+        calib.offset = 0.0
+        self.calibrationChanged.emit(device_id, calib.direction, 0.0)
+        # The new zero is the current spot, so any stored hold setpoint (e.g. one
+        # frozen mid-swing on disable) is now stale and would swing the shaft back
+        # there on the next enable. Reset it to the new zero.
+        if target is not None:
+            target.position = 0.0
+        # Refresh the readout once so the new zero shows immediately. The motor is
+        # disabled at this point (either it already was, or we just disabled it),
+        # so poll_status is safe - it will not inject a brake frame into a live
+        # control loop.
+        status = self._bus.poll_status(device_id)
+        if status is not None:
+            self.statusUpdated.emit(
+                device_id, self._decalibrate(device_id, status, calib))
+        # Read the motor's own zero back so the UI confirms it stuck.
+        self._read_zero_state(device_id)
+        # Bring the motor back up holding the new zero if it was running before;
+        # _enable re-seeds the hold from the (now ~0) live position, so the shaft
+        # stays put rather than jumping.
+        if was_enabled:
+            self._enable(device_id)
+
+    def _stop_sweep(self, device_id: int, target: MotorTarget) -> None:
+        """Clear a running sweep, freezing its setpoint where it left off. Emits
+        ``sweepStopped`` so the UI's sweep button clears too. No-op if idle."""
+        if not target.sweep_enabled:
+            return
+        target.position = self._sweep_position(target)
+        target.sweep_enabled = False
+        self.sweepStopped.emit(device_id)
 
     def _set_mode(self, device_id: int, mode: int) -> None:
         if not self._bus:
@@ -500,6 +623,11 @@ class ControlWorker(QObject):
         self._bus.set_run_mode(device_id, mode)
         target.mode = mode
         if was_enabled:
+            # Safe-enable on the re-enable too: switching an enabled motor into a
+            # position mode would otherwise snap it to the stale setpoint. Seed
+            # the current position first, exactly as _enable does.
+            if mode in _POSITION_MODES or mode == RunMode.MIT:
+                self._seed_hold_position(device_id, target)
             # Re-arm the motor-side watchdog too: this disable/enable pulse is
             # a full enable, and firmware may not keep canTimeout across it.
             self._configure_motor_watchdog(device_id)
@@ -556,6 +684,7 @@ class ControlWorker(QObject):
             self.log.emit("E-STOP engaged")
             if self._bus:
                 for device_id, target in self._targets.items():
+                    self._stop_sweep(device_id, target)
                     if target.enabled:
                         try:
                             self._bus.disable(device_id)
@@ -762,6 +891,7 @@ class ControlWorker(QObject):
                 continue
             if status is not None:
                 self.statusUpdated.emit(device_id, status)
+                self._enforce_range_cutout(device_id, target, status.position)
             if read_power:
                 self._read_power(device_id)
         if self._bus is not None and self._comm_failures == failures_before:
@@ -788,6 +918,35 @@ class ControlWorker(QObject):
         vbus = float(vbus)
         iq = float(iq)
         self.powerUpdated.emit(device_id, PowerInfo(device_id, vbus, iq, vbus * iq))
+
+    def _enforce_range_cutout(self, device_id: int, target: MotorTarget,
+                              user_pos: float) -> None:
+        """Disable the motor if live feedback leaves the calibrated range.
+
+        Position/MIT setpoints are already clamped to the range, but velocity and
+        current modes have NO position clamp - this feedback-driven cutout is the
+        only thing that stops the shaft driving through an end-stop in those
+        modes. Skipped while range-calibrating, since that deliberately moves the
+        shaft past the old bounds to redefine them.
+        """
+        if device_id in self._range_cal:
+            return
+        lo, hi = self._range.get(device_id, (None, None))
+        if lo is None and hi is None:
+            return
+        m = RANGE_TRIP_MARGIN_RAD
+        if (lo is not None and user_pos < lo - m) or \
+           (hi is not None and user_pos > hi + m):
+            try:
+                self._bus.disable(device_id)
+            except Exception:
+                pass
+            target.enabled = False
+            self._stop_sweep(device_id, target)
+            self.motorEnabledChanged.emit(device_id, False)
+            self.error.emit(
+                f"M{device_id}: position {math.degrees(user_pos):+.1f} deg left "
+                "the calibrated range - motor disabled for safety")
 
     def _command_motor(self, device_id: int, t: MotorTarget) -> Optional[MotorStatus]:
         """Clamp the target in the *user* frame, convert to the *raw* motor frame

@@ -14,7 +14,7 @@ Two sides, no hardware needed:
 from __future__ import annotations
 
 from robstride_gui import worker as wk
-from robstride_gui.protocol import ParameterType
+from robstride_gui.protocol import MotorStatus, ParameterType
 from robstride_gui.transport import TransportError
 
 
@@ -145,6 +145,17 @@ class RecordingBus:
 
     def set_run_mode(self, device_id, mode):
         pass
+
+    def read_param(self, device_id, param):
+        return 0.0  # power/param reads
+
+    def poll_status(self, device_id):
+        # safe-enable reads the current position (status frame) before enabling
+        return MotorStatus(device_id=device_id, position=0.0, velocity=0.0,
+                           torque=0.0, temperature=0.0)
+
+    def set_position(self, device_id, position_rad, velocity_limit=None):
+        return None  # loc_ref pre-load; not asserted here
 
     def write_param(self, device_id, param, value):
         self.param_writes.append((device_id, param.index, value))
