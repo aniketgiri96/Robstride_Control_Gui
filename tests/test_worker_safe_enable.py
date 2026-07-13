@@ -55,7 +55,7 @@ class FakeBus:
 def _make_worker(mode: int, current_pos: float = 1.234):
     worker = wk.ControlWorker()
     worker._bus = FakeBus(current_pos)
-    worker.motor_can_timeout_ms = 0  # skip the watchdog write for a clean trace
+    worker.motor_can_timeout_raw = 0  # skip the watchdog write for a clean trace
     worker._targets[1] = wk.MotorTarget(mode=mode)
     return worker
 
@@ -136,7 +136,8 @@ def test_velocity_mode_enable_does_not_seed_position():
 
 def test_failed_position_read_still_enables_but_warns():
     worker = _make_worker(RunMode.POSITION_PP)
-    worker._bus.poll_status = lambda device_id: None  # read fails
+    worker._bus.poll_status = lambda device_id: None       # operation-frame poll fails
+    worker._bus.read_param = lambda device_id, param: None  # and the mechPos read too
     errors: list[str] = []
     worker.error.connect(errors.append)
 
@@ -144,3 +145,19 @@ def test_failed_position_read_still_enables_but_warns():
 
     assert worker._targets[1].enabled is True   # still enables
     assert errors and "could not read position" in errors[0]
+
+
+def test_position_read_falls_back_to_param_when_poll_fails():
+    # A disabled or fault-latched motor can decline the operation-frame poll while
+    # still answering a plain parameter read. The seed must fall back to mechPos
+    # and NOT cry "check the connection" for a reachable motor.
+    worker = _make_worker(RunMode.POSITION_PP, current_pos=0.7)
+    worker._bus.poll_status = lambda device_id: None  # only the poll fails
+    errors: list[str] = []
+    worker.error.connect(errors.append)
+
+    worker._apply(wk.Enable(device_id=1))
+
+    assert not errors                                       # reachable => no false alarm
+    assert math.isclose(worker._targets[1].position, 0.7)   # seeded from mechPos read
+    assert math.isclose(worker._last_raw_pos[1], 0.7)

@@ -41,6 +41,12 @@ class FakeBus:
         self.calls.append(("set_position", device_id, position_rad))
         return None
 
+    def write_param(self, device_id, param, value):
+        # _enable/_set_mode push the current/torque limit registers via
+        # write_param; these guard tests do not assert on them, so record and ack.
+        self.calls.append(("write_param", device_id, param, value))
+        return object()
+
     def enable(self, device_id):
         self.calls.append(("enable", device_id))
         return None
@@ -56,7 +62,7 @@ class FakeBus:
 def _worker(bus=None):
     worker = wk.ControlWorker()
     worker._bus = bus or FakeBus()
-    worker.motor_can_timeout_ms = 0
+    worker.motor_can_timeout_raw = 0
     return worker
 
 

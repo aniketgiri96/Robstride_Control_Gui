@@ -28,6 +28,7 @@ from ..transport import (
     auto_detect_serial_port, list_serial_port_details,
 )
 from .. import worker as wk
+from .dashboard import MotorDashboard
 from .device_dialog import DeviceDialog
 from .motor_panel import MotorPanel
 
@@ -125,9 +126,28 @@ class MainWindow(QMainWindow):
         self.tabs.setMovable(True)
         root.addWidget(self.tabs, 1)
 
+        # The overview dashboard is the primary operating surface: all motors on
+        # one screen. The per-motor detail tabs stay for deep work (MIT gains,
+        # sweep, device tools). Kept as tab 0 so it opens first.
+        self._build_dashboard()
+
         self.setCentralWidget(central)
         self._build_log_dock()
         self._build_preset_dock()
+
+    def _build_dashboard(self) -> None:
+        self.dashboard = MotorDashboard()
+        # The dashboard re-emits each row's high-level signals; route them to the
+        # same worker-command handlers the detail panels use, so both surfaces
+        # drive the motor identically.
+        self.dashboard.enableToggled.connect(self._on_enable_toggled)
+        self.dashboard.targetChanged.connect(self._on_target_changed)
+        self.dashboard.modeChanged.connect(
+            lambda did, m: self.worker.post(wk.SetMode(did, m)))
+        self.dashboard.rangeLimitsEdited.connect(self._on_range_limits_edited)
+        self.dashboard.lockChanged.connect(self._on_lock_changed)
+        self.dashboard.log.connect(self._append_log)
+        self.tabs.addTab(self.dashboard, "Overview")
 
     def _build_shortcuts(self) -> None:
         # F11 toggles full screen; Esc leaves it. Both are no-ops otherwise.
@@ -442,6 +462,7 @@ class MainWindow(QMainWindow):
             self.worker.post(wk.SetMotorId(current_id=cur, new_id=new))
 
     def _remove_panel(self, device_id: int) -> None:
+        self.dashboard.remove_motor(device_id)
         panel = self.panels.pop(device_id, None)
         if panel is None:
             return
@@ -470,16 +491,20 @@ class MainWindow(QMainWindow):
         self.panels[device_id] = panel
         self.tabs.addTab(panel, f"Motor {device_id}")
         self.tabs.setCurrentWidget(panel)
+        # Mirror the motor onto the overview dashboard so it shows up there too.
+        self.dashboard.add_motor(device_id, model)
         # Restore this motor's saved software calibration, if any, and push it to
         # the worker so display and commands use it from the first frame.
         stored = self.calibrations.get(device_id)
         if stored is not None:
             panel.set_calibration_display(stored.direction, stored.offset)
             self.worker.post(wk.SetCalibration(device_id, stored.direction, stored.offset))
+            self.dashboard.set_locked(device_id, stored.locked)
             # Restore the calibrated travel range so inputs and motion are clamped
             # from the first frame, mirroring the zero/direction restore above.
             if stored.pos_min is not None or stored.pos_max is not None:
                 panel.set_position_limits(stored.pos_min, stored.pos_max)
+                self.dashboard.set_position_limits(device_id, stored.pos_min, stored.pos_max)
                 self.worker.post(wk.SetRangeLimits(device_id, stored.pos_min, stored.pos_max))
         self._append_log(f"Added motor {device_id} ({model})")
         # A motor added after Connect must be registered with the worker too,
@@ -546,6 +571,7 @@ class MainWindow(QMainWindow):
         panel = self.panels.get(device_id)
         if panel is not None:
             panel.update_status(status)
+        self.dashboard.update_status(device_id, status)
         faults = ",".join(name for name, flag in (
             ("stall", status.stalled), ("encoder", status.encoder_fault),
             ("overtemp", status.overtemperature), ("overcur", status.overcurrent),
@@ -558,6 +584,7 @@ class MainWindow(QMainWindow):
         panel = self.panels.get(device_id)
         if panel is not None:
             panel.update_power(power)
+        self.dashboard.update_power(device_id, power)
         self.datalog.update_power(device_id, power.vbus, power.iq, power.power)
 
     @Slot(bool)
@@ -598,6 +625,7 @@ class MainWindow(QMainWindow):
         panel = self.panels.get(device_id)
         if panel is not None:
             panel.set_enabled_state(enabled)
+        self.dashboard.set_enabled_state(device_id, enabled)
 
     def _on_panel_calibration_changed(self, device_id: int, direction: int,
                                       offset: float) -> None:
@@ -606,23 +634,37 @@ class MainWindow(QMainWindow):
         self._persist_calibration(device_id, direction, offset)
 
     def _persist_calibration(self, device_id: int, direction: int, offset: float) -> None:
-        # Preserve any calibrated range already stored for this motor: a
-        # zero/direction change must not silently drop the travel limits.
+        # Preserve any calibrated range and lock state already stored for this
+        # motor: a zero/direction change must not silently drop the travel limits
+        # or unlock calibration.
         prev = self.calibrations.get(device_id)
         pos_min = prev.pos_min if prev is not None else None
         pos_max = prev.pos_max if prev is not None else None
+        locked = prev.locked if prev is not None else True
         self.calibrations.upsert(
-            CalibrationRecord(device_id, direction, offset, pos_min, pos_max))
+            CalibrationRecord(device_id, direction, offset, pos_min, pos_max, locked))
         self.calibrations.save()
 
     def _persist_range(self, device_id: int, pos_min: float | None,
                        pos_max: float | None) -> None:
-        # Symmetric to _persist_calibration: keep the existing direction/offset.
+        # Symmetric to _persist_calibration: keep the existing direction/offset/lock.
         prev = self.calibrations.get(device_id)
         direction = prev.direction if prev is not None else 1
         offset = prev.offset if prev is not None else 0.0
+        locked = prev.locked if prev is not None else True
         self.calibrations.upsert(
-            CalibrationRecord(device_id, direction, offset, pos_min, pos_max))
+            CalibrationRecord(device_id, direction, offset, pos_min, pos_max, locked))
+        self.calibrations.save()
+
+    def _on_lock_changed(self, device_id: int, locked: bool) -> None:
+        """Persist the dashboard calibration lock, keeping all other fields."""
+        prev = self.calibrations.get(device_id)
+        direction = prev.direction if prev is not None else 1
+        offset = prev.offset if prev is not None else 0.0
+        pos_min = prev.pos_min if prev is not None else None
+        pos_max = prev.pos_max if prev is not None else None
+        self.calibrations.upsert(
+            CalibrationRecord(device_id, direction, offset, pos_min, pos_max, locked))
         self.calibrations.save()
 
     def _on_range_calibration_toggled(self, device_id: int, active: bool) -> None:
@@ -643,6 +685,7 @@ class MainWindow(QMainWindow):
         panel = self.panels.get(device_id)
         if panel is not None:
             panel.set_position_limits(pos_min, pos_max)
+        self.dashboard.set_position_limits(device_id, pos_min, pos_max)
         self._persist_range(device_id, pos_min, pos_max)
 
     @Slot(int, object)
@@ -690,6 +733,8 @@ class MainWindow(QMainWindow):
         if checked:
             for panel in self.panels.values():
                 panel.set_enabled_state(False)
+            for device_id in self.dashboard.rows:
+                self.dashboard.set_enabled_state(device_id, False)
 
     # -- presets -----------------------------------------------------------------
 

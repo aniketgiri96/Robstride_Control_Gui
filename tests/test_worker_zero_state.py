@@ -119,6 +119,12 @@ class RecordingBus:
         self.calls.append("set_position")
         return None
 
+    def write_param(self, device_id, param, value):
+        # _enable pushes the current/torque limit registers via write_param; the
+        # set-zero flow does not assert on them, so record the call and ack it.
+        self.calls.append("write_param")
+        return object()
+
     def enable(self, device_id):
         self.calls.append("enable")
         return None
@@ -131,7 +137,7 @@ def test_set_zero_while_enabled_disables_zeros_then_reenables():
 
     bus = RecordingBus()
     worker = _worker(bus)
-    worker.motor_can_timeout_ms = 0  # skip the watchdog write for a clean trace
+    worker.motor_can_timeout_raw = 0  # skip the watchdog write for a clean trace
     worker._targets[3] = wk.MotorTarget(mode=RunMode.POSITION_PP, enabled=True)
     worker._targets[3].position = 1.5  # a stale hold setpoint from before zeroing
 

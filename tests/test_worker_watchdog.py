@@ -147,6 +147,13 @@ class RecordingBus:
         pass
 
     def read_param(self, device_id, param):
+        # The canTimeout readback (arm verification) echoes the last value the
+        # motor was told to store; other reads (power/param) return 0.0.
+        if param is ParameterType.CAN_TIMEOUT:
+            for did, index, value in reversed(self.param_writes):
+                if index == param.index and did == device_id:
+                    return value
+            return 0
         return 0.0  # power/param reads
 
     def poll_status(self, device_id):
@@ -170,12 +177,13 @@ def test_enable_arms_motor_side_can_timeout():
     bus = RecordingBus()
     worker = wk.ControlWorker()
     worker._bus = bus
+    worker.motor_can_timeout_raw = 1000  # opt in: the arm write only runs when > 0
 
     worker._enable(4)
 
     timeout_writes = [(did, value) for did, index, value in bus.param_writes
                       if index == ParameterType.CAN_TIMEOUT.index]
-    assert timeout_writes == [(4, wk.MOTOR_CAN_TIMEOUT_MS)]
+    assert timeout_writes == [(4, 1000)]
     assert bus.enabled == [4]
 
 
@@ -183,7 +191,7 @@ def test_enable_skips_can_timeout_when_disabled_by_config():
     bus = RecordingBus()
     worker = wk.ControlWorker()
     worker._bus = bus
-    worker.motor_can_timeout_ms = 0  # operator opted out
+    worker.motor_can_timeout_raw = 0  # operator opted out
 
     worker._enable(4)
 
@@ -201,6 +209,7 @@ def test_unacked_can_timeout_write_still_enables_but_raises_error():
     bus = NoAckBus()
     worker = wk.ControlWorker()
     worker._bus = bus
+    worker.motor_can_timeout_raw = 1000  # opt in so the (unacked) arm write runs
     errors: list[str] = []
     worker.error.connect(errors.append)
 

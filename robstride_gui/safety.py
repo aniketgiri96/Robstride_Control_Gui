@@ -39,7 +39,11 @@ class SafetyLimits:
             position_min=-span,
             position_max=span,
             velocity_max=0.6 * lim["velocity"],
-            current_max=10.0,
+            # 25 A current ceiling: the 10 A default throttled rs-04 torque to
+            # ~15 Nm (torque is current-limited well before the torque_max cap).
+            # Raised to let torque climb toward torque_max; more current means
+            # more heat/force, so watch temperature when running near it.
+            current_max=25.0,
             torque_max=0.5 * lim["torque"],
             kp_max=lim["kp"],
             kd_max=lim["kd"],

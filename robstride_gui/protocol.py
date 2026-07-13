@@ -81,6 +81,23 @@ class RunMode:
     }
 
 
+class MotorMode:
+    """Operational state reported in an OPERATION_STATUS frame (arb-id bits 22-23).
+
+    This is the motor's *energisation* state, distinct from :class:`RunMode` (the
+    0x7005 control-law register). ``RESET`` means the motor has de-energised
+    itself back to standby - it is limp and ignoring setpoints - which is exactly
+    how a firmware CAN-watchdog trip looks on the wire: mode drops 2 -> 0 with no
+    fault bit set. ``MOTOR`` is the normal running/holding state.
+    """
+
+    RESET = 0    # standby / de-energised (limp)
+    CALI = 1     # calibration in progress
+    MOTOR = 2    # running: actively controlled / holding
+
+    NAMES: Final = {RESET: "Reset", CALI: "Cali", MOTOR: "Motor"}
+
+
 # --- register / parameter map ----------------------------------------------------
 
 
@@ -382,11 +399,20 @@ class MotorStatus:
     overtemperature: bool = False
     overcurrent: bool = False
     undervoltage: bool = False
+    #: Energisation state (:class:`MotorMode`). Defaults to ``MOTOR`` so a status
+    #: built by hand (tests, synthetic feedback) reads as "running" and does not
+    #: look like a watchdog drop.
+    mode: int = MotorMode.MOTOR
 
     @property
     def has_fault(self) -> bool:
         return any((self.stalled, self.encoder_fault, self.overtemperature,
                     self.overcurrent, self.undervoltage))
+
+    @property
+    def is_standby(self) -> bool:
+        """True when the motor has de-energised itself to standby (limp)."""
+        return self.mode == MotorMode.RESET
 
 
 def parse_status(frame: Frame, model: str) -> MotorStatus:
@@ -407,6 +433,7 @@ def parse_status(frame: Frame, model: str) -> MotorStatus:
         overtemperature=bool((extra >> 10) & 0x01),
         overcurrent=bool((extra >> 9) & 0x01),
         undervoltage=bool((extra >> 8) & 0x01),
+        mode=(extra >> 14) & 0x03,
     )
 
 

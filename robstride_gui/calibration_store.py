@@ -41,6 +41,10 @@ class CalibrationRecord:
     # keys and these defaults fill the missing ones.
     pos_min: float | None = None
     pos_max: float | None = None
+    # Dashboard calibration lock: when True the overview screen's CV1/CV2 edits
+    # are disabled so they cannot be nudged during operation. Defaults to locked
+    # (the safe state) and, like the range fields, is backfilled for old files.
+    locked: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)

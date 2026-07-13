@@ -32,8 +32,9 @@ def test_for_model_derives_conservative_defaults_from_datasheet():
     # velocity/torque are intentionally gentled to a fraction of the absolute max
     assert s.velocity_max == pytest.approx(0.6 * lim["velocity"])
     assert s.torque_max == pytest.approx(0.5 * lim["torque"])
-    # current is a fixed conservative cap, gains pass through at model max
-    assert s.current_max == pytest.approx(10.0)
+    # current is a fixed cap (25 A) so torque can climb toward torque_max
+    # instead of being current-throttled to ~15 Nm; gains pass through at model max
+    assert s.current_max == pytest.approx(25.0)
     assert s.kp_max == pytest.approx(lim["kp"])
     assert s.kd_max == pytest.approx(lim["kd"])
 

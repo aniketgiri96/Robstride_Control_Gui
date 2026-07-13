@@ -28,6 +28,30 @@ from .transport import Transport
 logger = logging.getLogger(__name__)
 
 
+#: Reverse map comm_type value -> name for readable frame logs. Built from the
+#: int constants on CommunicationType (a plain constants class, not an IntEnum).
+_COMM_TYPE_NAMES: dict[int, str] = {
+    value: name
+    for name, value in vars(CommunicationType).items()
+    if not name.startswith("_") and isinstance(value, int)
+}
+
+
+def _frame_desc(frame: Frame) -> str:
+    """One-line human description of a CAN frame for TX/RX debug logging.
+
+    Names the comm-type (ENABLE/DISABLE/WRITE_PARAMETER/OPERATION_STATUS/...),
+    the id byte, the host/extra field, and the raw payload. The comm-type + id
+    is what makes a cross-motor bug visible on the wire: e.g. a DISABLE carrying
+    id=6 appearing while only motor 4 was commanded, or a motor self-emitting an
+    OPERATION_STATUS while we addressed a different one. Both ``device_id`` and
+    ``extra`` are shown because a reply can carry the motor id in either field
+    (which is why the match-filter checks both)."""
+    name = _COMM_TYPE_NAMES.get(frame.comm_type, f"type{frame.comm_type}")
+    return (f"{name} id={frame.device_id} extra=0x{frame.extra_data:04X} "
+            f"data={frame.data.hex()}")
+
+
 @dataclass
 class Motor:
     """A motor registered on the bus."""
@@ -78,9 +102,26 @@ class RobstrideBus:
     # -- low-level request/response ---------------------------------------------
 
     def _send(self, frame: Frame) -> None:
+        self._log_frame("TX", frame)
         self.transport.send(frame)
         if self.config.inter_command_delay:
             time.sleep(self.config.inter_command_delay)
+
+    def _log_frame(self, direction: str, frame: Frame) -> None:
+        """Log one frame at DEBUG (enable with ROBSTRIDE_DEBUG=1). No-op and
+        near-zero cost otherwise. See :func:`_frame_desc` for the format."""
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("%s %s", direction, _frame_desc(frame))
+
+    def _recv_logged(self, timeout: float) -> Optional[Frame]:
+        """recv one frame and log EVERY frame *before* any match-filtering, so an
+        unsolicited frame - e.g. a motor self-reporting DISABLED while we were
+        addressing a different motor - is visible instead of silently dropped by
+        the caller's comm-type/id filter. This is the point of the capture."""
+        frame = self.transport.recv(timeout=timeout)
+        if frame is not None:
+            self._log_frame("RX", frame)
+        return frame
 
     def _await(self, comm_types: tuple[int, ...], device_id: Optional[int],
                timeout: Optional[float] = None) -> Optional[Frame]:
@@ -88,7 +129,7 @@ class RobstrideBus:
         timeout = self.config.response_timeout if timeout is None else timeout
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            frame = self.transport.recv(timeout=max(0.0, deadline - time.monotonic()))
+            frame = self._recv_logged(max(0.0, deadline - time.monotonic()))
             if frame is None:
                 continue
             if frame.comm_type not in comm_types:
@@ -133,7 +174,7 @@ class RobstrideBus:
         deadline = time.monotonic() + timeout
         seen: list[bytes] = []
         while time.monotonic() < deadline:
-            frame = self.transport.recv(timeout=max(0.0, deadline - time.monotonic()))
+            frame = self._recv_logged(max(0.0, deadline - time.monotonic()))
             if frame is None:
                 continue
             if frame.comm_type not in (CommunicationType.GET_DEVICE_ID,
@@ -318,17 +359,7 @@ class RobstrideBus:
         """
         frame = proto.build_operation(device_id, 0.0, 0.0, 0.0, 0.0, 0.0,
                                       self.model_of(device_id))
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("poll_status M%d TX ext_id=0x%08X data=%s",
-                         device_id, frame.ext_id, proto.encode_at(frame).hex())
+        # TX/RX frames are now logged centrally by _send / _recv_logged under
+        # DEBUG (ROBSTRIDE_DEBUG=1), so no bespoke poll logging is needed here.
         self._send(frame)
-        status = self._read_status(device_id)
-        if logger.isEnabledFor(logging.DEBUG):
-            if status is None:
-                logger.debug("poll_status M%d RX: no status frame "
-                             "(timeout after %.0fms or fault)",
-                             device_id, self.config.response_timeout * 1000)
-            else:
-                logger.debug("poll_status M%d RX: pos=%.3f vel=%.3f torque=%.3f",
-                             device_id, status.position, status.velocity, status.torque)
-        return status
+        return self._read_status(device_id)

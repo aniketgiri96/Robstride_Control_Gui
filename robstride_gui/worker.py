@@ -24,7 +24,7 @@ from PySide6.QtCore import QObject, Signal
 
 from . import protocol as proto
 from .bus import BusConfig, Motor, RobstrideBus
-from .protocol import MotorStatus, ParameterType, RunMode
+from .protocol import MotorMode, MotorStatus, ParameterType, RunMode
 from .safety import Calibration, SafetyLimits, SafetyState
 from .transport import Transport, TransportError
 
@@ -216,10 +216,27 @@ class StopRangeCalibration(Command):
 # --- board power telemetry ------------------------------------------------------
 
 #: Read VBUS/Iq once every Nth control loop. The control loop runs at 100 Hz; a
-#: divisor of 20 polls the board power registers at ~5 Hz, which is plenty for a
-#: voltage/current readout while keeping the extra READ_PARAMETER round-trips off
-#: the hot path so they never delay a setpoint write.
-POWER_READ_DIVISOR: int = 20
+#: divisor of 4 polls the board power registers at ~25 Hz. This is set for
+#: power diagnostics - fast enough to catch the voltage dip / current spike when
+#: a motor is enabled (a sub-100 ms transient the old ~5 Hz rate stepped over),
+#: while not so fast it floods the bus with READ_PARAMETER traffic that competes
+#: with setpoint writes. Raise back to ~20 (5 Hz) once the power question is
+#: settled to keep the round-trips off the hot path.
+POWER_READ_DIVISOR: int = 4
+
+#: Log a VBUS line only when the bus voltage moves at least this many volts from
+#: the last value logged for that motor. At the ~25 Hz diagnostic read rate this
+#: keeps a steady rail silent and turns a sag+recovery into a couple of lines,
+#: instead of flooding the log with every sample. Set well above the ~0.3 V read
+#: noise so ordinary jitter does not trip it. Lower it to catch a subtler dip.
+VBUS_LOG_DELTA_V: float = 1.0
+
+#: Emit a full per-motor telemetry line to the log every Nth control loop. At the
+#: 100 Hz loop rate a divisor of 50 gives ~2 Hz per motor - slow enough to read
+#: and copy from the log dock, fast enough to catch a hold dropping when another
+#: motor is enabled. This is the "detailed log" for diagnosing by eye; the opt-in
+#: telemetry file still keeps the full-rate record. Raise to silence it.
+VERBOSE_LOG_DIVISOR: int = 50
 
 
 # --- communication watchdog ------------------------------------------------------
@@ -231,19 +248,91 @@ POWER_READ_DIVISOR: int = 20
 #: that a yanked adapter does not leave enabled motors unsupervised for long.
 COMM_FAILURE_LIMIT: int = 10
 
-#: Motor-side watchdog, written to the ``canTimeout`` register (0x7028) on
-#: every Enable. A host-side watchdog cannot help when the *host* dies (process
-#: crash, cable pull): in velocity/current mode the motor would keep executing
-#: its last setpoint forever. With canTimeout armed the motor stops itself when
-#: no frame arrives within the window. The worker refreshes setpoints every
-#: 10 ms, so 1000 ms has a wide safety margin against false trips. Set the
-#: worker's ``motor_can_timeout_ms`` to 0 to skip the write.
+#: Any command whose handler blocks the single-threaded control loop longer than
+#: this (milliseconds) is logged with its measured duration. The worker services
+#: motors and applies commands on one thread, so this block is dead time for every
+#: *other* enabled motor - no hold frame goes out while it runs. A slow
+#: enable/mode-switch here is the direct measure of the starvation window that can
+#: let a bystander motor trip its firmware watchdog and go limp (the "M6 drops
+#: when M5 mode-switches" bug). A normal per-tick setpoint write is well under
+#: 1 ms; lower this to see every blocking op.
+SLOW_COMMAND_LOG_MS: float = 20.0
+
+#: Motor-side watchdog: the RAW value written to the ``canTimeout`` register
+#: (0x7028) on every Enable. A host-side watchdog cannot help when the *host*
+#: dies (process crash, cable pull): in velocity/current mode the motor would
+#: keep executing its last setpoint forever. With canTimeout armed the motor
+#: stops itself when no frame arrives within the window. Set the worker's
+#: ``motor_can_timeout_raw`` to 0 to skip the write.
 #:
-#: NOTE: the millisecond unit is assumed from the register spec but has not
-#: been verified on this hardware. On first use, enable a motor, stop sending
-#: (unplug the adapter) and confirm it actually stops after ~1 s: much sooner
-#: or never means the firmware interprets the value differently - adjust here.
-MOTOR_CAN_TIMEOUT_MS: int = 1000
+#: THE UNIT IS NOT MILLISECONDS. It was long *assumed* to be ms, and 1000 was
+#: written as "1 s". Field capture (frames.log, 2026-07-10) disproves that:
+#: with canTimeout=1000 armed *and read back as 1000*, every motor still tripped
+#: to standby at a servicing gap of ~60 ms (median 66 ms across all six motors,
+#: no fault bit). So 1000 raw == ~60 ms, i.e. ~0.06 ms per count - the register
+#: never widened the window at all, and the keepalive interleaving alone
+#: (``_feed_other_motors``) could not hold every bystander's gap under that
+#: ~60 ms firmware default once 5-6 motors were enabled at once. That is the
+#: real cause of the "auto-disable" cascades: bystanders trip during each
+#: enable handshake, the hold-recovery re-enable starves the next motor, and
+#: after MAX_HOLD_RECOVERY_ATTEMPTS the worker gives up and leaves them off.
+#:
+#: 5000 raw targets ~300 ms at the inferred ~0.06 ms/count - comfortably above
+#: the 92 ms worst-case gap seen on the wire, so ordinary handshake starvation
+#: no longer trips the watchdog. If the unit were actually ms after all, 5000
+#: means a 5 s host-death stop: longer than ideal but still safe, and the
+#: calibration below resolves the ambiguity. VERIFY per hardware with
+#: :func:`recommend_can_timeout_raw` fed a measured point from
+#: :meth:`ControlWorker.measure_can_timeout` (the starve test is the only thing
+#: that proves the real duration).
+MOTOR_CAN_TIMEOUT_RAW: int = 5000
+
+#: Target watchdog window, in milliseconds, that :data:`MOTOR_CAN_TIMEOUT_RAW`
+#: is chosen to hit. Wide enough to clear the worst observed servicing gap
+#: (~92 ms) with margin, but short enough to stop a runaway ~this long after a
+#: true host death. Feed it to :func:`recommend_can_timeout_raw` with a measured
+#: calibration point to get the raw value for a given board.
+MOTOR_CAN_TIMEOUT_TARGET_MS: float = 300.0
+
+
+def recommend_can_timeout_raw(armed_raw: int, observed_stop_ms: float,
+                              target_ms: float = MOTOR_CAN_TIMEOUT_TARGET_MS) -> int:
+    """Convert one starve-test data point into the raw canTimeout for ``target_ms``.
+
+    The canTimeout register (0x7028) unit is not documented and is *not*
+    milliseconds on this firmware (see :data:`MOTOR_CAN_TIMEOUT_RAW`). Given one
+    measured point - you armed ``armed_raw`` and the motor actually stopped
+    ``observed_stop_ms`` after the last frame - the count-to-ms scale is
+    ``observed_stop_ms / armed_raw`` (assumed linear through the origin, which
+    matches a simple down-counter). This inverts it to the raw value that lands
+    on ``target_ms``:
+
+        raw = round(target_ms * armed_raw / observed_stop_ms)
+
+    Both inputs must be positive; a zero/negative ``observed_stop_ms`` means the
+    starve test never saw a stop (the watchdog is disabled or the value did not
+    arm), so there is nothing to scale and we raise rather than return a bogus
+    number. The result is clamped to at least 1 (0 would disable the watchdog).
+    """
+    if armed_raw <= 0:
+        raise ValueError(f"armed_raw must be positive, got {armed_raw}")
+    if observed_stop_ms <= 0:
+        raise ValueError(
+            "observed_stop_ms must be positive; a non-positive value means the "
+            "starve test saw no stop (watchdog disabled or value did not arm)")
+    ms_per_count = observed_stop_ms / armed_raw
+    return max(1, round(target_ms / ms_per_count))
+
+#: Consecutive auto-re-enable attempts before the worker gives up on a motor that
+#: keeps reverting to standby. A motor that trips its firmware CAN-watchdog (e.g.
+#: momentarily starved during another motor's enable) recovers on the first
+#: attempt - and the re-enable no longer starves the others, because it feeds them
+#: via ``_feed_other_motors`` (fix #1), which is what makes auto-recovery safe
+#: instead of a ping-pong. If a motor still reports standby after this many
+#: re-enables the cause is persistent (wiring, a too-short canTimeout, a genuine
+#: fault), so the worker stops the retry storm, leaves it disabled, and surfaces
+#: it to the operator rather than energising it every control tick forever.
+MAX_HOLD_RECOVERY_ATTEMPTS: int = 3
 
 
 @dataclass(frozen=True)
@@ -327,11 +416,32 @@ class ControlWorker(QObject):
         # restore when calibration stops.
         self._range_cal: dict[int, dict] = {}
         self._last_raw_pos: dict[int, float] = {}
+        # Last-seen set of active fault-flag names per motor, so faults are
+        # logged only on change (rising/falling edge) instead of every 100 Hz
+        # cycle. Cleared when a motor disables so re-enabling logs afresh.
+        self._motor_faults: dict[int, frozenset[str]] = {}
+        # Consecutive auto-re-enable attempts for a motor that reverted to standby
+        # while we held it enabled, reset the moment it reports running again. Caps
+        # the retry storm at MAX_HOLD_RECOVERY_ATTEMPTS (see _recover_dropped_hold).
+        self._hold_recovery_attempts: dict[int, int] = {}
+        # Last VBUS value logged per motor, so the diagnostic power log fires only
+        # on a significant voltage move (see VBUS_LOG_DELTA_V), not every sample.
+        self._last_logged_vbus: dict[int, float] = {}
+        # Newest (vbus, iq) read per motor, carried into the verbose telemetry
+        # line so each row shows voltage/current alongside position and torque.
+        self._last_power: dict[int, tuple[float, float]] = {}
         self._safety = SafetyState(SafetyLimits.for_model(proto.DEFAULT_MODEL))
         self._rate_hz = rate_hz
         self._loop_count = 0
         self._comm_failures = 0
-        self.motor_can_timeout_ms = MOTOR_CAN_TIMEOUT_MS
+        self.motor_can_timeout_raw = MOTOR_CAN_TIMEOUT_RAW
+        # Motors whose canTimeout arm has already been read back and confirmed
+        # this session. The readback is a second blocking register round-trip
+        # inside the enable handshake - the exact starvation window that trips a
+        # bystander's watchdog - so it runs once per motor, not on every
+        # auto-recovery re-enable. Cleared for a motor on disable so a fresh
+        # enable re-verifies, and wholesale on disconnect.
+        self._watchdog_verified: set[int] = set()
 
     # -- public, thread-safe API (called from the GUI thread) --------------------
 
@@ -365,12 +475,33 @@ class ControlWorker(QObject):
                 cmd = self._queue.get_nowait()
             except queue.Empty:
                 return
+            t0 = time.monotonic()
             try:
                 self._apply(cmd)
             except TransportError as e:
                 self.error.emit(str(e))
             except Exception as e:  # never let one bad command kill the loop
                 self.error.emit(f"{type(e).__name__}: {e}")
+            finally:
+                self._log_slow_command(cmd, time.monotonic() - t0)
+
+    def _log_slow_command(self, cmd: "Command", elapsed_s: float) -> None:
+        """Log any command whose handler blocked the loop past SLOW_COMMAND_LOG_MS.
+
+        The worker is single-threaded: while this handler runs, no other enabled
+        motor gets a hold frame. The measured duration is exactly that starvation
+        window, so a slow enable/mode-switch shows up here as a number to compare
+        against a motor's firmware watchdog - the mechanism behind a bystander
+        motor going limp when another is enabled. Names the command and target so
+        the culprit is unambiguous."""
+        elapsed_ms = elapsed_s * 1000.0
+        if elapsed_ms < SLOW_COMMAND_LOG_MS:
+            return
+        device_id = getattr(cmd, "device_id", None)
+        target = f" M{device_id}" if device_id is not None else ""
+        self.log.emit(
+            f"[timing]{target} {type(cmd).__name__} blocked the loop "
+            f"{elapsed_ms:.0f} ms")
 
     def _apply(self, cmd: Command) -> None:
         if isinstance(cmd, Connect):
@@ -447,6 +578,11 @@ class ControlWorker(QObject):
                 pass
             self._bus = None
             self._comm_failures = 0
+            self._motor_faults.clear()
+            self._hold_recovery_attempts.clear()
+            self._watchdog_verified.clear()
+            self._last_logged_vbus.clear()
+            self._last_power.clear()
             self.connectionChanged.emit(False)
             self.log.emit("Disconnected")
 
@@ -488,6 +624,7 @@ class ControlWorker(QObject):
         # across power cycles, so without this it may sit in MIT mode and ignore
         # every position/velocity/current setpoint we send.
         self._bus.set_run_mode(device_id, target.mode)
+        self._feed_other_motors(device_id)
         # Safe-enable: seed the setpoint to the shaft's *current* position so the
         # motor comes up HOLDING where it is. Without this it snaps to the last
         # (default 0.0) position target the instant it is enabled, which can slam
@@ -495,9 +632,16 @@ class ControlWorker(QObject):
         # position; velocity/current default to 0 (no motion) and need no seed.
         if target.mode in _POSITION_MODES or target.mode == RunMode.MIT:
             self._seed_hold_position(device_id, target)
+        # The seed above can be several blocking round-trips; feed the others
+        # before pressing on so their watchdogs do not starve (see
+        # _feed_other_motors).
+        self._feed_other_motors(device_id)
+        self._configure_motor_limits(device_id)
         self._configure_motor_watchdog(device_id)
+        self._feed_other_motors(device_id)
         self._bus.enable(device_id)
         target.enabled = True
+        self._feed_other_motors(device_id)
         # Re-assert the hold setpoint AFTER enabling. The pre-enable seed above is
         # a belt-and-suspenders: RobStride ignores a loc_ref (POSITION_TARGET)
         # write while the motor is disabled, so on its own it keeps the internal
@@ -517,27 +661,51 @@ class ControlWorker(QObject):
     def _seed_hold_position(self, device_id: int, target: MotorTarget) -> None:
         """Make the shaft's current position the hold setpoint before enabling.
 
-        The reading comes from ``poll_status`` so it is in the SAME frame as the
-        live feedback and the motor's mechanical zero. A plain ``mechPos`` param
-        read can lag a just-applied Set Zero: it would seed the setpoint in the
-        old frame and swing the shaft back to its pre-zero position on enable.
+        The primary reading comes from ``poll_status`` so it is in the SAME frame
+        as the live feedback and the motor's mechanical zero. A plain ``mechPos``
+        param read can lag a just-applied Set Zero: it would seed the setpoint in
+        the old frame and swing the shaft back to its pre-zero position on enable.
         The motor is always disabled at this point, so the zero-gain status frame
-        commands no motion. For profiled/CSP modes we also pre-load ``loc_ref``
-        so the first hold is the current spot. A failed read is surfaced loudly:
-        enabling blind risks the jump this guards against.
+        commands no motion.
+
+        ``poll_status`` relies on an operation-control frame, though, and a
+        disabled or fault-latched motor can decline to ack that while still
+        answering a plain parameter read. So if the poll comes back empty, fall
+        back to reading ``mechPos`` (comm 17) before giving up: that keeps us from
+        enabling blind - and from mislabelling a reachable motor as a dead link -
+        whenever the operation-frame poll is the only thing failing. The fallback
+        runs only when the poll fails, so the fresh-after-Set-Zero case still uses
+        ``poll_status`` and is unaffected. For profiled/CSP modes we also pre-load
+        ``loc_ref`` so the first hold is the current spot. A read that fails BOTH
+        ways is surfaced loudly: enabling blind risks the jump this guards against.
         """
         status = self._bus.poll_status(device_id)
-        if status is None:
+        raw = float(status.position) if status is not None \
+            else self._read_mech_pos(device_id)
+        if raw is None:
             self.error.emit(
                 f"M{device_id}: could not read position before enable - the "
-                "motor may jump to its last target. Check the connection.")
+                "motor may jump to its last target. Check power and wiring.")
             return
-        raw = float(status.position)
         c = self._calib.get(device_id) or Calibration()
         self._last_raw_pos[device_id] = raw
         target.position = c.pos_from_raw(raw)
         if target.mode in _POSITION_MODES:
             self._bus.set_position(device_id, raw, self._safety.limits.velocity_max)
+
+    def _read_mech_pos(self, device_id: int) -> Optional[float]:
+        """Read the shaft's mechanical position via a parameter read (comm 17).
+
+        Unlike ``poll_status``' operation-control frame, a plain READ_PARAMETER is
+        answered by a disabled or fault-latched motor, so it is a reliable
+        fallback for seeding the pre-enable hold. Returns ``None`` if the motor
+        does not answer or the bus errors.
+        """
+        try:
+            val = self._bus.read_param(device_id, ParameterType.MEASURED_POSITION)
+        except TransportError:
+            return None
+        return None if val is None else float(val)
 
     def _disable(self, device_id: int) -> None:
         if not self._bus:
@@ -549,6 +717,14 @@ class ControlWorker(QObject):
             # Stop any sweep so the next enable holds position instead of
             # resuming the trajectory - that would defeat safe-enable.
             self._stop_sweep(device_id, target)
+        # Forget the last fault set so a re-enable reports its faults fresh.
+        self._motor_faults.pop(device_id, None)
+        # An operator disable is a clean slate: forget any in-progress hold-drop
+        # recovery so a later manual enable starts its attempt count from zero.
+        self._hold_recovery_attempts.pop(device_id, None)
+        # Re-verify the canTimeout arm on the next enable (the motor may have
+        # been power-cycled or reconfigured while disabled).
+        self._watchdog_verified.discard(device_id)
         self.motorEnabledChanged.emit(device_id, False)
         self.log.emit(f"M{device_id}: disabled")
 
@@ -620,6 +796,9 @@ class ControlWorker(QObject):
         was_enabled = target.enabled
         if was_enabled:
             self._bus.disable(device_id)
+            # This motor is now briefly down; feed the others while we
+            # reconfigure it so their watchdogs stay fed (see _feed_other_motors).
+            self._feed_other_motors(device_id)
         self._bus.set_run_mode(device_id, mode)
         target.mode = mode
         if was_enabled:
@@ -628,10 +807,32 @@ class ControlWorker(QObject):
             # the current position first, exactly as _enable does.
             if mode in _POSITION_MODES or mode == RunMode.MIT:
                 self._seed_hold_position(device_id, target)
+            self._feed_other_motors(device_id)
+            # Re-push the current/torque limits: a run-mode rewrite can reset the
+            # motor's limit registers to a default (or zero), and without this the
+            # motor re-enables with no torque budget and sits LIMP (exactly 0.00 Nm
+            # / 0.0 A) - the "motor goes dead after a mode switch" bug. _enable
+            # writes these on every enable; the mode-switch re-enable must too.
+            self._configure_motor_limits(device_id)
             # Re-arm the motor-side watchdog too: this disable/enable pulse is
             # a full enable, and firmware may not keep canTimeout across it.
             self._configure_motor_watchdog(device_id)
+            self._feed_other_motors(device_id)
             self._bus.enable(device_id)
+            self._feed_other_motors(device_id)
+            # Re-assert the hold setpoint AFTER enabling, exactly as _enable does.
+            # RobStride ignores a loc_ref (POSITION_TARGET) write while the motor
+            # is disabled, so the _seed_hold_position call above - done while
+            # disabled - does NOT latch the target. Without this the position loop
+            # comes up with no valid hold and the motor sits limp (zero torque)
+            # and drifts instead of holding, which reads as "the motor dropped its
+            # hold after a mode switch". Writing loc_ref once more here, now that
+            # the motor accepts it, pins the hold to the seeded spot. See
+            # robstride-locref-disabled-quirk and the matching step in _enable.
+            if mode in _POSITION_MODES:
+                raw = self._last_raw_pos.get(device_id)
+                if raw is not None:
+                    self._bus.set_position(device_id, raw, self._safety.limits.velocity_max)
         self.log.emit(f"M{device_id}: mode -> {RunMode.NAMES.get(mode, mode)}")
 
     def _set_target(self, cmd: SetTarget) -> None:
@@ -828,19 +1029,51 @@ class ControlWorker(QObject):
         self.log.emit(f"M{device_id}: motor zero_sta={info['zero_sta']}, "
                       f"mechOffset={info['mech_offset']}")
 
+    def _configure_motor_limits(self, device_id: int) -> None:
+        """Push the software current/torque caps into the motor's own limit
+        registers so they apply in *every* run-mode.
+
+        Only velocity mode wrote ``limit_cur`` before (via ``set_velocity``), so
+        in position/MIT mode the motor kept whatever current/torque limit it
+        powered up with - a ~10 A default throttles an rs-04 to ~15 Nm, far
+        below ``torque_max``. Writing them on each enable makes the software caps
+        authoritative regardless of mode. Best-effort: a motor that does not ack
+        still enables.
+        """
+        lim = self._safety.limits
+        if lim.current_max is not None:
+            self._bus.write_param(device_id, ParameterType.CURRENT_LIMIT,
+                                  float(lim.current_max))
+        if lim.torque_max is not None:
+            self._bus.write_param(device_id, ParameterType.TORQUE_LIMIT,
+                                  float(lim.torque_max))
+
     def _configure_motor_watchdog(self, device_id: int) -> None:
         """Arm the motor's own CAN watchdog before enabling it.
 
-        Writes ``motor_can_timeout_ms`` to the canTimeout register (0x7028) so
+        Writes ``motor_can_timeout_raw`` to the canTimeout register (0x7028) so
         the motor stops itself if the host goes silent - the failure a
-        host-side watchdog cannot cover. Best-effort: a motor that does not
-        ack the write still enables, but the gap is logged so the operator
-        knows the safety net is missing.
+        host-side watchdog cannot cover - and widens the firmware watchdog past
+        its short (~60 ms) stored default so ordinary servicing gaps no longer
+        trip a bystander (see :data:`MOTOR_CAN_TIMEOUT_RAW` for why the old
+        1000-as-1s value did not, and what the raw unit actually is).
+        Best-effort: a motor that does not ack the write still enables, but the
+        gap is surfaced as an error so the operator knows the safety net is
+        missing.
+
+        The write goes out on *every* enable (cheap, one frame). The readback
+        that confirms it stuck is a second blocking register round-trip - dead
+        air for the other motors, inside the very starvation window that trips
+        their watchdogs - so it runs only the first time each motor is armed
+        this session, not on every hold-recovery re-enable. A readback of 0/None
+        means the arm silently failed; a different non-zero value means the
+        firmware clamped or rescaled it. Only the starve test
+        (:meth:`measure_can_timeout`) proves the real timeout duration.
         """
-        timeout_ms = int(self.motor_can_timeout_ms)
-        if timeout_ms <= 0:
+        raw = int(self.motor_can_timeout_raw)
+        if raw <= 0:
             return
-        ack = self._bus.write_param(device_id, ParameterType.CAN_TIMEOUT, timeout_ms)
+        ack = self._bus.write_param(device_id, ParameterType.CAN_TIMEOUT, raw)
         if ack is None:
             # error (not just log): an unarmed motor-side watchdog is the most
             # safety-relevant gap here - the motor will NOT stop on its own if
@@ -848,6 +1081,166 @@ class ControlWorker(QObject):
             self.error.emit(
                 f"M{device_id}: canTimeout write not acked - the motor will "
                 "NOT stop on its own if the link to the host drops")
+            self._watchdog_verified.discard(device_id)  # re-verify next enable
+            return
+        if device_id in self._watchdog_verified:
+            return  # already confirmed this session - skip the blocking readback
+        try:
+            stored = self._bus.read_param(device_id, ParameterType.CAN_TIMEOUT)
+        except TransportError:
+            return  # readback is confirmation only; a hiccup here is not fatal
+        if not stored:
+            # Reads back 0 or nothing: the write did not stick, so the watchdog
+            # is NOT armed despite the ack - as safety-relevant as no ack at all.
+            self.error.emit(
+                f"M{device_id}: canTimeout did not stick (reads back {stored}) - "
+                "the motor will NOT stop on its own if the host link drops")
+        elif int(stored) != raw:
+            # Armed, but not with our value: the firmware reinterpreted it, so the
+            # real stop time is unknown until verified by the starve test.
+            self.log.emit(
+                f"M{device_id}: canTimeout wrote {raw}, motor stored "
+                f"{int(stored)} - verify the actual stop time")
+            self._watchdog_verified.add(device_id)
+        else:
+            self._watchdog_verified.add(device_id)
+
+    def measure_can_timeout(self, device_id: int, candidate_raw: int,
+                            probes_ms: "Optional[list[float]]" = None,
+                            ) -> "Optional[float]":
+        """Measure the real canTimeout window for ``candidate_raw`` by starving it.
+
+        The register unit is not milliseconds (see :data:`MOTOR_CAN_TIMEOUT_RAW`),
+        so the only way to know what a raw value buys is to arm it and see how
+        long the motor holds with no frames. This automates that "unplug test"
+        *without* unplugging: for each silence duration in ``probes_ms``
+        (ascending) it arms ``candidate_raw``, re-enables the motor so it is
+        running and holding, then sends **nothing** for that long and polls once.
+        A poll frame resets the watchdog, so it is sent only at the *end* of the
+        silence - during the wait the motor is truly starved. The first probe
+        after which the motor reports standby brackets the timeout; the returned
+        estimate is the midpoint between that probe and the previous (still
+        holding) one. Feed it to :func:`recommend_can_timeout_raw` to get the raw
+        value for :data:`MOTOR_CAN_TIMEOUT_TARGET_MS`.
+
+        Returns the estimated window in ms, or ``None`` if the motor never
+        dropped within the longest probe (the value is already very wide, or -
+        less likely - a poll resets a watchdog that a control frame would not).
+        Blocking and operator-invoked: run it on a *single* motor with the bus
+        otherwise idle, never during normal operation. Best-effort; a bus error
+        aborts and returns ``None``.
+        """
+        if self._bus is None or self._safety.estop or candidate_raw <= 0:
+            return None
+        probes = sorted(probes_ms or [50.0, 100.0, 200.0, 400.0, 800.0, 1600.0])
+        saved_raw = self.motor_can_timeout_raw
+        self.motor_can_timeout_raw = candidate_raw
+        prev = 0.0
+        try:
+            for wait_ms in probes:
+                self._watchdog_verified.discard(device_id)  # force a fresh arm
+                self._enable(device_id)                     # arms + energises + holds
+                time.sleep(wait_ms / 1000.0)                # dead silence: no frames
+                status = self._bus.poll_status(device_id)   # resets watchdog, reads mode
+                if status is not None and status.mode == MotorMode.RESET:
+                    estimate = (prev + wait_ms) / 2.0
+                    self.log.emit(
+                        f"M{device_id}: canTimeout={candidate_raw} raw dropped "
+                        f"between {prev:.0f} and {wait_ms:.0f} ms silence "
+                        f"(~{estimate:.0f} ms)")
+                    return estimate
+                prev = wait_ms
+        except TransportError:
+            return None
+        finally:
+            self.motor_can_timeout_raw = saved_raw
+            self._disable(device_id)
+        self.log.emit(
+            f"M{device_id}: canTimeout={candidate_raw} raw still holding after "
+            f"{probes[-1]:.0f} ms - window is at least that wide")
+        return None
+
+    def _feed_other_motors(self, exclude_id: int) -> None:
+        """Send one hold frame to every *other* enabled motor.
+
+        The worker is single-threaded, so a multi-step enable / mode-switch
+        handshake for one motor is dead air for all the others: no setpoint
+        frame goes out while it runs (the whole sequence is drained before the
+        service loop gets a turn). A bystander motor whose firmware CAN-watchdog
+        window is shorter than that handshake reverts to standby and goes limp -
+        the "M6 drops to mode 0 when M5 is enabled" bug, seen on the wire as a
+        mode 2 -> mode 0 flip with *no* fault bit and a steady VBUS. Calling this
+        between the blocking steps of the handshake keeps the bystanders'
+        watchdogs fed: each gets the same hold frame the service loop would send,
+        capping any one motor's starvation to a single handshake step instead of
+        the whole sequence.
+
+        Best-effort: a bus error on a keepalive is swallowed rather than torn
+        down here, so a transient hiccup cannot abort the in-progress enable
+        mid-sequence. The 100 Hz service loop and its comm-failure watchdog own
+        link-death detection.
+        """
+        if self._bus is None or self._safety.estop:
+            return
+        for device_id, target in list(self._targets.items()):
+            if device_id == exclude_id or not target.enabled:
+                continue
+            try:
+                self._command_motor(device_id, target)
+            except TransportError:
+                pass
+            if self._bus is None:
+                return
+
+    def _recover_dropped_hold(self, device_id: int, target: MotorTarget,
+                              status: MotorStatus) -> None:
+        """Re-enable a motor that silently reverted to standby while enabled.
+
+        A RobStride motor whose firmware CAN-watchdog trips (starved during
+        another motor's blocking enable, before fix #1's keepalives closed that
+        window - or a canTimeout shorter than a servicing gap) de-energises to
+        :data:`MotorMode.RESET`: limp, ignoring setpoints, yet still ACKing our
+        writes, so nothing else notices it stopped holding. It sets NO fault bit
+        and the supply stays flat; the mode field is the only tell.
+
+        On seeing that drop we re-run the full safe-enable, which re-seeds the
+        hold at the shaft's *current* position (no snap-back) and, via
+        ``_feed_other_motors``, does not starve the other motors in turn - the
+        reason this is safe now and was a ping-pong hazard before. If the motor
+        still reports standby after :data:`MAX_HOLD_RECOVERY_ATTEMPTS` re-enables
+        the cause is persistent: stop, leave it disabled, and tell the operator.
+
+        The attempt counter resets the instant the motor reports running again,
+        so an isolated drop that recovers on the first try never counts against a
+        later, unrelated one.
+        """
+        if self._safety.estop or device_id in self._range_cal:
+            return
+        if status.mode == MotorMode.MOTOR:
+            self._hold_recovery_attempts.pop(device_id, None)  # holding again
+            return
+        if status.mode != MotorMode.RESET:
+            return  # transient CALI or unknown state - do not act on it
+        attempts = self._hold_recovery_attempts.get(device_id, 0)
+        if attempts >= MAX_HOLD_RECOVERY_ATTEMPTS:
+            self._hold_recovery_attempts.pop(device_id, None)
+            try:
+                self._bus.disable(device_id)
+            except Exception:
+                pass
+            target.enabled = False
+            self._stop_sweep(device_id, target)
+            self.motorEnabledChanged.emit(device_id, False)
+            self.error.emit(
+                f"M{device_id}: keeps dropping to standby after {attempts} "
+                "re-enable attempts - left disabled. Check the motor's CAN "
+                "watchdog (canTimeout), wiring, and bus load.")
+            return
+        self._hold_recovery_attempts[device_id] = attempts + 1
+        self.log.emit(
+            f"M{device_id}: hold dropped to standby (no fault) - auto "
+            f"re-enabling (attempt {attempts + 1}/{MAX_HOLD_RECOVERY_ATTEMPTS})")
+        self._enable(device_id)
 
     # -- host-side communication watchdog -----------------------------------------
 
@@ -891,11 +1284,58 @@ class ControlWorker(QObject):
                 continue
             if status is not None:
                 self.statusUpdated.emit(device_id, status)
+                self._log_motor_faults(device_id, status)
+                self._log_verbose_status(device_id, status)
                 self._enforce_range_cutout(device_id, target, status.position)
+                # After the range cutout (which may have just disabled it): if the
+                # motor is still meant to be enabled but reports standby, its hold
+                # dropped - re-enable it. Guarded by target.enabled so a motor the
+                # cutout just tripped is not immediately re-energised.
+                if target.enabled:
+                    self._recover_dropped_hold(device_id, target, status)
             if read_power:
                 self._read_power(device_id)
         if self._bus is not None and self._comm_failures == failures_before:
             self._comm_failures = 0  # clean pass: the link is healthy again
+
+    #: Human-readable labels for the fault bits in a status frame, in priority
+    #: order. ``undervoltage``/``overcurrent`` come first: those are the ones
+    #: that fire when a shared supply can't hold the current of an extra motor.
+    _FAULT_LABELS = (
+        ("undervoltage", "UNDERVOLTAGE (supply sagged below motor minimum)"),
+        ("overcurrent", "OVERCURRENT (demanded more current than allowed)"),
+        ("stalled", "STALLED (commanded torque but could not move)"),
+        ("overtemperature", "OVERTEMPERATURE"),
+        ("encoder_fault", "ENCODER FAULT"),
+    )
+
+    def _log_motor_faults(self, device_id: int, status: MotorStatus) -> None:
+        """Log a motor's fault bits when they change, not every cycle.
+
+        Every feedback frame carries the fault flags (undervoltage, overcurrent,
+        stalled, ...). Logging them raw at 100 Hz would flood the UI, so we track
+        the last-seen active set per motor and emit only on a rising edge (a new
+        fault appears) or falling edge (all faults clear). The message includes
+        live VBUS-adjacent context - torque and temperature from the same frame -
+        so a power sag is visible in one line: e.g. a motor that sets
+        ``undervoltage`` the instant a third motor is enabled is the direct CAN
+        evidence that the supply, not the software, dropped the hold.
+        """
+        active = frozenset(
+            name for name, _ in self._FAULT_LABELS if getattr(status, name)
+        )
+        if active == self._motor_faults.get(device_id, frozenset()):
+            return
+        self._motor_faults[device_id] = active
+        if not active:
+            self.log.emit(f"M{device_id}: faults cleared")
+            return
+        labels = ", ".join(
+            label for name, label in self._FAULT_LABELS if name in active
+        )
+        self.error.emit(
+            f"M{device_id}: FAULT {labels} "
+            f"[torque={status.torque:+.2f} Nm, temp={status.temperature:.0f}C]")
 
     def _read_power(self, device_id: int) -> None:
         """Read the board's bus voltage and current and emit derived power.
@@ -917,7 +1357,47 @@ class ControlWorker(QObject):
             return
         vbus = float(vbus)
         iq = float(iq)
+        self._last_power[device_id] = (vbus, iq)
         self.powerUpdated.emit(device_id, PowerInfo(device_id, vbus, iq, vbus * iq))
+        self._log_power_change(device_id, vbus, iq)
+
+    def _log_verbose_status(self, device_id: int, status: MotorStatus) -> None:
+        """Emit a throttled, human-readable telemetry line to the log dock.
+
+        One line per motor at ~2 Hz (see VERBOSE_LOG_DIVISOR) with position,
+        board voltage/current (from the newest power read), torque, temperature
+        and the active fault set - the "detailed log" you can watch and copy
+        straight from the GUI while reproducing a hold drop. VBUS/Iq show ``---``
+        until the first power read for that motor lands.
+        """
+        if self._loop_count % VERBOSE_LOG_DIVISOR != 0:
+            return
+        power = self._last_power.get(device_id)
+        power_s = (f"VBUS {power[0]:5.1f}V Iq {power[1]:+5.1f}A"
+                   if power is not None else "VBUS   ---  Iq   ---")
+        faults = ",".join(
+            name for name, _ in self._FAULT_LABELS if getattr(status, name)
+        ) or "ok"
+        self.log.emit(
+            f"M{device_id}: pos {math.degrees(status.position):+7.1f}deg  "
+            f"{power_s}  torque {status.torque:+6.2f}Nm  "
+            f"{status.temperature:4.0f}C  [{faults}]")
+
+    def _log_power_change(self, device_id: int, vbus: float, iq: float) -> None:
+        """Log VBUS/Iq only when the bus voltage moves at least VBUS_LOG_DELTA_V
+        from the last logged value, so a supply sag when another motor is enabled
+        shows up in the log timeline (dip and recovery) without flooding it. The
+        first reading just seeds the baseline silently."""
+        prev = self._last_logged_vbus.get(device_id)
+        self._last_logged_vbus[device_id] = vbus
+        if prev is None or abs(vbus - prev) < VBUS_LOG_DELTA_V:
+            if prev is not None:
+                # Not a significant move: keep the baseline where it was so small
+                # drifts accumulate against a fixed reference instead of ratcheting.
+                self._last_logged_vbus[device_id] = prev
+            return
+        self.log.emit(
+            f"M{device_id}: VBUS {prev:.1f} -> {vbus:.1f} V, Iq {iq:+.1f} A")
 
     def _enforce_range_cutout(self, device_id: int, target: MotorTarget,
                               user_pos: float) -> None:
