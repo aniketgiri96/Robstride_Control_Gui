@@ -31,6 +31,7 @@ from .. import worker as wk
 from .dashboard import MotorDashboard
 from .device_dialog import DeviceDialog
 from .motor_panel import MotorPanel
+from .sim_dock import SimBridgeDock
 
 PLOT_REFRESH_MS = 33  # ~30 FPS
 
@@ -134,6 +135,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self._build_log_dock()
         self._build_preset_dock()
+        self._build_sim_dock()
 
     def _build_dashboard(self) -> None:
         self.dashboard = MotorDashboard()
@@ -239,6 +241,17 @@ class MainWindow(QMainWindow):
 
         lay.addStretch(1)
 
+        self.disable_all_btn = QPushButton("Disable all")
+        self.disable_all_btn.setToolTip("De-energise every motor (standby / limp)")
+        self.disable_all_btn.clicked.connect(self._on_disable_all)
+        lay.addWidget(self.disable_all_btn)
+
+        self.zero_all_btn = QPushButton("Zero all")
+        self.zero_all_btn.setToolTip(
+            "Set every motor's zero to its current position")
+        self.zero_all_btn.clicked.connect(self._on_zero_all)
+        lay.addWidget(self.zero_all_btn)
+
         self.estop_btn = QPushButton("E-STOP")
         self.estop_btn.setCheckable(True)
         self.estop_btn.setMinimumWidth(120)
@@ -314,6 +327,52 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
         dock.setWidget(w)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
+
+    def _build_sim_dock(self) -> None:
+        """Add the MuJoCo bridge on/off dock (tabbed under the Presets dock)."""
+        self.sim_dock = SimBridgeDock(self.worker, self._sim_joint_map, parent=self)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.sim_dock)
+        # Stack it with the Presets dock so it doesn't widen the window.
+        for existing in self.findChildren(QDockWidget):
+            if existing is not self.sim_dock and \
+                    self.dockWidgetArea(existing) == Qt.RightDockWidgetArea:
+                self.tabifyDockWidget(existing, self.sim_dock)
+                break
+
+    def _sim_joint_map(self) -> dict[str, int]:
+        """Map MuJoCo joint names to connected CAN ids for the sim bridge.
+
+        Prefers a ``sim_bindings.json`` (``{joint_name: can_id}``) so an operator
+        can pin the real joint<->motor identification; otherwise falls back to
+        ``revolute_<id> -> <id>`` for every connected motor, which matches the
+        naming the MuJoCo scripts assume. Only ids that are actually connected are
+        kept, so a stale bindings file can't command a motor that isn't present.
+
+        The file is looked for at ``mujoco/2_run_bridge/sim_bindings.json`` (its
+        home in the staged MuJoCo folder) first, then a plain ``sim_bindings.json``
+        in the working directory for backward compatibility.
+        """
+        import json
+        from pathlib import Path
+
+        connected = set(self.panels)
+        candidates = [
+            Path("mujoco") / "2_run_bridge" / "sim_bindings.json",
+            Path("sim_bindings.json"),
+        ]
+        bindings_path = next((p for p in candidates if p.is_file()), None)
+        if bindings_path is not None:
+            try:
+                raw = json.loads(bindings_path.read_text())
+                mapped = {str(name): int(cid) for name, cid in raw.items()
+                          if int(cid) in connected}
+                if mapped:
+                    return mapped
+                self._append_log(
+                    f"{bindings_path} matched no connected motors; using default map")
+            except (ValueError, TypeError, OSError) as exc:
+                self._append_log(f"{bindings_path} ignored ({exc}); using default map")
+        return {f"revolute_{did}": did for did in sorted(connected)}
 
     # -- connection bar logic ----------------------------------------------------
 
@@ -461,6 +520,15 @@ class MainWindow(QMainWindow):
         if confirm == QMessageBox.Yes:
             self.worker.post(wk.SetMotorId(current_id=cur, new_id=new))
 
+    def _refresh_sim_map(self) -> None:
+        """Rebuild the sim bridge's joint map after the motor set changes, so a
+        motor connected while the bridge is streaming is picked up without an
+        off/on toggle. Guarded with getattr so it is safe if the motor set changes
+        before the sim dock exists."""
+        dock = getattr(self, "sim_dock", None)
+        if dock is not None:
+            dock.refresh_joint_map()
+
     def _remove_panel(self, device_id: int) -> None:
         self.dashboard.remove_motor(device_id)
         panel = self.panels.pop(device_id, None)
@@ -470,6 +538,7 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.tabs.removeTab(idx)
         panel.deleteLater()
+        self._refresh_sim_map()
 
     def _add_motor(self, device_id: int, model: str) -> MotorPanel:
         if device_id in self.panels:
@@ -512,6 +581,9 @@ class MainWindow(QMainWindow):
         # motors open at connect time).
         if self._connected:
             self.worker.post(wk.AddMotor(device_id=device_id, model=model))
+        # Pick this motor up in the sim bridge's joint map if it is streaming, so
+        # a motor connected after the bridge started needs no off/on toggle.
+        self._refresh_sim_map()
         return panel
 
     @Slot(int, bool)
@@ -736,6 +808,41 @@ class MainWindow(QMainWindow):
             for device_id in self.dashboard.rows:
                 self.dashboard.set_enabled_state(device_id, False)
 
+    def _on_disable_all(self) -> None:
+        """De-energise every motor and reflect the disabled state in the UI."""
+        ids = list(self.panels)
+        if not ids:
+            return
+        for device_id in ids:
+            self.worker.post(wk.Disable(device_id))
+            self.panels[device_id].set_enabled_state(False)
+            if device_id in self.dashboard.rows:
+                self.dashboard.set_enabled_state(device_id, False)
+        self._append_log(f"Disabled all motors ({len(ids)})")
+
+    def _on_zero_all(self) -> None:
+        """Set every motor's zero to its current position, after confirmation."""
+        if not self._connected:
+            self._on_error("Connect to the bus before zeroing motors")
+            return
+        ids = list(self.panels)
+        if not ids:
+            return
+        confirm = QMessageBox.question(
+            self, "Zero all motors",
+            f"Set the zero reference of all {len(ids)} motors to their CURRENT "
+            "position?\n\nThis re-defines each motor's zero; it does not move "
+            "them. Make sure every motor is at the pose you want to call zero.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        for device_id in ids:
+            self.worker.post(wk.SetZero(device_id))
+            # Mirror per-motor zeroing: arm the one-shot enable confirmation so
+            # re-enabling after a bulk zero still warns before energising.
+            self._zeroed_since_enable.add(device_id)
+        self._append_log(f"Zeroed all motors ({len(ids)})")
+
     # -- presets -----------------------------------------------------------------
 
     def _reload_preset_combo(self) -> None:
@@ -802,6 +909,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         try:
+            self.sim_dock.shutdown()
             self.worker.stop()
             self.thread.quit()
             self.thread.wait(2000)

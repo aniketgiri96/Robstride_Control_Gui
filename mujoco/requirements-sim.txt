@@ -1,0 +1,9 @@
+# Extra dependencies for the out-of-process MuJoCo scripts
+# (mujoco_dashboard.py, mujoco_teach.py). The GUI itself does NOT need these -
+# its side of the bridge (robstride_gui/sim/mujoco_bridge.py) is pure PySide6.
+#
+#   pip install -r requirements.txt -r requirements-sim.txt
+
+mujoco>=3.0.0        # physics + passive viewer
+numpy>=1.24.0        # sim math / plotting buffers
+matplotlib>=3.7.0    # live plots in mujoco_dashboard.py (uses the TkAgg backend)

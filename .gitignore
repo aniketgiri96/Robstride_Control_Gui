@@ -6,3 +6,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# experiment datasets (commit deliberately)
+experiments/data/
+experiments/

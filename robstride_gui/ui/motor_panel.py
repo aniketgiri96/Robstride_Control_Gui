@@ -119,11 +119,19 @@ class MotorPanel(QWidget):
         self.enable_btn.clicked.connect(self._on_enable_clicked)
         self.zero_btn = QPushButton("Set Zero")
         self.zero_btn.clicked.connect(lambda: self.zeroRequested.emit(self.device_id))
+        self.limp_btn = QPushButton("Make LIMP")
+        self.limp_btn.setToolTip(
+            "Back-drivable bring-up: switch to MIT mode, zero Kp/Kd and the "
+            "assist torque, then enable. The motor reports its encoder while free "
+            "to move by hand - use it to teach the arm (the sim mirrors it) or to "
+            "move through the travel during range calibration.")
+        self.limp_btn.clicked.connect(self._on_make_limp)
         self.state_dot = QLabel("●")
         self.state_dot.setStyleSheet("color: #b71c1c; font-size: 18px;")
         lay.addWidget(self.state_dot)
         lay.addWidget(self.enable_btn)
         lay.addWidget(self.zero_btn)
+        lay.addWidget(self.limp_btn)
         lay.addStretch(1)
         return box
 
@@ -381,6 +389,44 @@ class MotorPanel(QWidget):
 
     def _on_enable_clicked(self, checked: bool) -> None:
         self.enableToggled.emit(self.device_id, checked)
+
+    def _on_make_limp(self) -> None:
+        """One-click back-drivable bring-up for hand-teaching / range calibration.
+
+        Puts the motor into MIT mode with zero stiffness, damping and assist
+        torque, then enables it, so it holds no position and can be moved freely
+        by hand while still reporting its encoder. Drives the existing widgets and
+        signals (mode combo, Kp/Kd/torque targets, enable), so the command path,
+        the field-enablement and the main-window guards (bus connected,
+        zeroed-since-enable confirmation) are exactly the same as doing it by hand.
+        """
+        # MIT mode first. setCurrentIndex emits modeChanged only on a real change,
+        # so refresh field enablement explicitly for the already-MIT case.
+        idx = self.mode_combo.findData(RunMode.MIT)
+        if idx >= 0 and self.mode_combo.currentIndex() != idx:
+            self.mode_combo.setCurrentIndex(idx)   # emits modeChanged -> SetMode
+        else:
+            self._update_field_enablement(RunMode.MIT)
+
+        # Zero the gains and assist torque in the UI without per-widget emits, then
+        # push them in one SetTarget so the motor comes up limp regardless of the
+        # prior Kp=28 / Kd=6 defaults or any leftover assist torque.
+        for spin in (self.kp_spin, self.kd_spin, self.tq_spin):
+            spin.blockSignals(True)
+            spin.setValue(0.0)
+            spin.blockSignals(False)
+        self.tq_slider.blockSignals(True)
+        self.tq_slider.setValue(0)
+        self.tq_slider.blockSignals(False)
+        self.targetChanged.emit(
+            self.device_id, {"kp": 0.0, "kd": 0.0, "torque_ff": 0.0})
+
+        # Finally enable (last, so the first MIT frame is already limp). Mirrors a
+        # real Enable click: reflect the checked state, then emit; the main window
+        # resets it via set_enabled_state if it rejects or the operator backs out.
+        if not self.enable_btn.isChecked():
+            self.enable_btn.setChecked(True)
+            self.enableToggled.emit(self.device_id, True)
 
     def _emit_calibration(self, *_args) -> None:
         direction = -1 if self.invert_check.isChecked() else 1

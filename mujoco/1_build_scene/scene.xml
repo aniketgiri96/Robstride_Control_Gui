@@ -1,0 +1,34 @@
+This XML file does not appear to have any style information associated with it. The document tree is shown below.
+<mujoco model="scene">
+<include file="main_assembly/urdf/main_assembly.xml"/>
+<option gravity="0 0 -9.81" integrator="implicitfast"/>
+<default>
+<joint damping="100" armature="0.01"/>
+</default>
+<visual>
+<headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3"/>
+</visual>
+<asset>
+<texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="512"/>
+<texture name="grid" type="2d" builtin="checker" rgb1="0.2 0.3 0.4" rgb2="0.1 0.15 0.2" width="300" height="300"/>
+<material name="grid" texture="grid" texrepeat="8 8" reflectance="0.2"/>
+</asset>
+<worldbody>
+<light pos="0 0 3" dir="0 0 -1" directional="true"/>
+<geom name="floor" type="plane" size="0 0 0.05" material="grid" contype="1" conaffinity="1" friction="1.5 0.05 0.01"/>
+<body name="target" mocap="true" pos="0 0 1.2">
+<geom type="box" size="0.04 0.04 0.04" rgba="1 0.2 0.2 0.4" contype="0" conaffinity="0"/>
+</body>
+</worldbody>
+<equality>
+<weld body1="base" body2="target" solref="0.02 1"/>
+</equality>
+<actuator>
+<position name="revolute_2" joint="revolute_2" gear="57.29578" kp="0.25" ctrlrange="-100.0 100.0"/>
+<position name="revolute_3" joint="revolute_3" gear="57.29578" kp="0.25" ctrlrange="-10.0 100.0"/>
+<position name="revolute_5" joint="revolute_5" gear="57.29578" kp="0.25" ctrlrange="-100.0 100.0"/>
+<position name="revolute_1" joint="revolute_1" gear="57.29578" kp="0.25" ctrlrange="-100.0 100.0"/>
+<position name="revolute_4" joint="revolute_4" gear="57.29578" kp="0.25" ctrlrange="-100.0 10.0"/>
+<position name="revolute_6" joint="revolute_6" gear="57.29578" kp="0.25" ctrlrange="-100.0 100.0"/>
+</actuator>
+</mujoco>

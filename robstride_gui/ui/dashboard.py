@@ -17,8 +17,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QVBoxLayout, QWidget,
+    QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
+    QScrollArea, QVBoxLayout, QWidget,
 )
 
 from .. import protocol as proto
@@ -107,6 +107,14 @@ class MotorDashboard(QWidget):
                              "(joints 1–6 → motor ids 1–6)")
         joint_btn.clicked.connect(self._on_import_joint_log_clicked)
         lay.addWidget(joint_btn)
+
+        self.smooth_chk = QCheckBox("Smooth")
+        self.smooth_chk.setChecked(True)
+        self.smooth_chk.setToolTip(
+            "Reconstruct continuous motion from a coarse (~5 Hz) hand-teach "
+            "capture so the motors ramp smoothly instead of stepping. Applies "
+            "to the next joint-log import; uncheck to play raw samples.")
+        lay.addWidget(self.smooth_chk)
 
         self.seq_meta_lbl = QLabel("no sequence loaded")
         self.seq_meta_lbl.setStyleSheet("color:#9e9e9e;")
@@ -238,18 +246,21 @@ class MotorDashboard(QWidget):
         path, _ = QFileDialog.getOpenFileName(
             self, "Import joint log", "", "Joint logs (*.csv);;All files (*)")
         if path:
-            self.load_joint_log_file(path)
+            self.load_joint_log_file(path, smooth=self.smooth_chk.isChecked())
 
     def load_joint_log_file(self, path: str,
                             joints: tuple[int, ...] = (1, 2, 3, 4, 5, 6),
-                            source: str = "pos") -> None:
+                            source: str = "pos", smooth: bool = True) -> None:
         """Load a recorded joint telemetry log, pinning joints to their CAN ids.
 
         Each ``revolute_<n>`` joint drives the motor with CAN id ``n``. The
         binding is stored as the explicit channel map so Play cannot re-order it.
+        ``smooth`` reconstructs continuous motion from a coarse capture (see
+        :func:`~robstride_gui.jointlog.load_joint_log`).
         """
         try:
-            seq, channel_map = load_joint_log(path, joints=joints, source=source)
+            seq, channel_map = load_joint_log(
+                path, joints=joints, source=source, smooth=smooth)
         except SequenceError as e:
             self._show_seq_error(f"Joint log import failed: {e}")
             return
@@ -258,7 +269,9 @@ class MotorDashboard(QWidget):
         mapping = ", ".join(f"j{ch}→id{did}"
                             for ch, did in zip(seq.channels,
                                                channel_map.values()))
-        self._activate_sequence(seq, f"{seq.describe()}  ({source}: {mapping})")
+        smooth_tag = "smoothed" if smooth else "raw"
+        self._activate_sequence(
+            seq, f"{seq.describe()}  ({source}, {smooth_tag}: {mapping})")
 
     def _activate_sequence(self, seq, meta_text: str) -> None:
         """Common tail for both importers: load the player and light the transport."""

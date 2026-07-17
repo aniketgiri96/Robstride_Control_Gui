@@ -19,7 +19,7 @@ import pytest
 
 from PySide6.QtWidgets import QApplication
 
-from robstride_gui.protocol import MotorStatus
+from robstride_gui.protocol import MotorStatus, RunMode
 from robstride_gui.ui.motor_row import MotorRow, is_warning
 
 
@@ -244,3 +244,35 @@ def test_ab_start_allowed_when_enabled(row):
     assert row.ab_active
     assert targets  # at least the immediate first step
     row.ab_btn.setChecked(False)  # stop the timer for teardown
+
+
+# -- Make LIMP -------------------------------------------------------------------
+
+
+def test_make_limp_sets_mit_zeroes_gains_and_enables(row):
+    # Arrange: motor disabled
+    row.set_enabled_state(False)
+    modes = _collect(row.modeChanged)
+    targets = _collect(row.targetChanged)
+    enables = _collect(row.enableToggled)
+
+    # Act
+    row.limp_btn.click()
+
+    # Assert: MIT mode, zeroed gains as one target, and enable - the back-drivable
+    # state for hand-teaching.
+    assert modes[-1] == (2, RunMode.MIT)
+    assert targets[-1] == (2, {"kp": 0.0, "kd": 0.0, "torque_ff": 0.0})
+    assert enables[-1] == (2, True)
+
+
+def test_make_limp_does_not_re_emit_enable_when_already_enabled(row):
+    # Arrange: motor already enabled
+    row.set_enabled_state(True)
+    enables = _collect(row.enableToggled)
+
+    # Act
+    row.limp_btn.click()
+
+    # Assert: gains still pushed, but no duplicate enable
+    assert enables == []

@@ -101,3 +101,47 @@ def test_blank_rows_skipped(tmp_path):
             "0.020,manual,0.0,0.0,0.0,0.0,0.0,10.0,0.0,0.0\n")
     seq, _ = load_joint_log(_write(tmp_path, text), joints=(6,))
     assert seq.frame_count == 2
+
+
+def test_leading_blank_line_before_header(tmp_path):
+    # Arrange: a stray CRLF/blank line before the header (as in downloaded copies).
+    seq, _ = load_joint_log(_write(tmp_path, "\n" + _LOG), joints=(3, 6))
+
+    # Assert: the header is still found and all data rows load.
+    assert seq.channels == ("3", "6")
+    assert seq.frame_count == 3
+
+
+def _staircase_log() -> str:
+    """A zero-order-hold capture: joint 6 held flat, then a one-frame jump."""
+    lines = [_HEADER]
+    for i in range(6):
+        pos = 0.0 if i < 5 else 12.0  # 5 held frames, then a 12 deg step
+        lines.append(f"{i * 0.01:.2f},manual,0.0,0.0,0.0,0.0,0.0,{pos},0.0,0.0")
+    return "\n".join(lines) + "\n"
+
+
+def test_smoothing_tames_a_staircase_jump(tmp_path):
+    # Arrange: the raw log steps 12 deg in a single frame.
+    seq, _ = load_joint_log(_write(tmp_path, _staircase_log()), joints=(6,))
+
+    # Act: largest frame-to-frame change after smoothing.
+    angles = [seq.angle_at(i, 0) for i in range(seq.frame_count)]
+    max_step = max(abs(angles[i + 1] - angles[i]) for i in range(len(angles) - 1))
+
+    # Assert: the ramp is spread across frames, well under the raw 12 deg step,
+    # and the endpoints are preserved (no overshoot).
+    assert max_step < math.radians(12.0)
+    assert angles[0] == pytest.approx(0.0)
+    assert angles[-1] == pytest.approx(math.radians(12.0))
+
+
+def test_smooth_false_preserves_raw_samples(tmp_path):
+    # Arrange / Act: opt out of smoothing.
+    seq, _ = load_joint_log(
+        _write(tmp_path, _staircase_log()), joints=(6,), smooth=False)
+    angles = [seq.angle_at(i, 0) for i in range(seq.frame_count)]
+
+    # Assert: the raw staircase is intact - flat, then the full 12 deg jump.
+    assert angles[4] == pytest.approx(0.0)
+    assert angles[5] == pytest.approx(math.radians(12.0))

@@ -29,6 +29,7 @@ import math
 import statistics
 from pathlib import Path
 
+from .interp import smooth_columns
 from .sequence import DEFAULT_FPS, Sequence, SequenceError
 
 #: Column that carries the per-frame timestamp (seconds), used to derive fps.
@@ -44,12 +45,21 @@ def load_joint_log(
     path: str | Path,
     joints: tuple[int, ...] = (1, 2, 3, 4, 5, 6),
     source: str = "pos",
+    smooth: bool = True,
 ) -> tuple[Sequence, dict[int, int]]:
     """Load a joint telemetry log as a playable sequence for ``joints``.
 
     ``joints`` are the ``revolute_<n>`` numbers to replay, in channel order; each
     also names the CAN id it drives, so the returned map is ``{i: joints[i]}``.
     ``source`` selects the ``pos`` (measured) or ``cmd`` (commanded) angle column.
+
+    ``smooth`` (default on) reconstructs continuous motion from a coarse capture:
+    hand-teach logs sample at ~100 Hz while the motor status behind them updates
+    at ~5 Hz, so each joint sits flat then jumps several degrees in one frame.
+    Replaying that verbatim drives the motors in jerky steps. Smoothing (see
+    :mod:`robstride_gui.interp`) fills the plateaus with gentle ramps without
+    overshooting any recorded angle. It needs the ``time`` column; without one the
+    track is left as recorded. Pass ``smooth=False`` to play the raw samples.
 
     Returns ``(sequence, channel_map)``. Raises :class:`SequenceError` on a
     missing file, an unknown ``source``, a missing joint column, or malformed data.
@@ -69,6 +79,12 @@ def load_joint_log(
         raise SequenceError(f"Could not read joint log {p}: {e}") from e
 
     rows = list(csv.reader(io.StringIO(text)))
+    # Skip leading blank rows: some captures start with a stray CRLF before the
+    # header (e.g. a downloaded copy), which would otherwise be read as an empty
+    # header with no columns.
+    start = next((i for i, r in enumerate(rows)
+                  if any(cell.strip() for cell in r)), len(rows))
+    rows = rows[start:]
     if len(rows) < 2:
         raise SequenceError("Joint log has no data rows")
 
@@ -97,6 +113,14 @@ def load_joint_log(
 
     if not frames:
         raise SequenceError("Joint log has no non-blank data rows")
+
+    # Reconstruct continuous motion from the zero-order-hold capture. Needs a
+    # per-frame timeline; without a usable one (no `time` column or a length
+    # mismatch) the frames play as recorded.
+    if smooth and len(times) == len(frames):
+        columns = [[frame[c] for frame in frames] for c in range(len(joints))]
+        smoothed = smooth_columns(times, columns)
+        frames = [tuple(col[i] for col in smoothed) for i in range(len(frames))]
 
     channels = tuple(str(j) for j in joints)
     channel_map = {i: j for i, j in enumerate(joints)}

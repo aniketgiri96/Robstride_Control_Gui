@@ -129,6 +129,15 @@ class MotorRow(QFrame):
         self.enable_btn.clicked.connect(
             lambda checked: self.enableToggled.emit(self.device_id, checked))
 
+        self.limp_btn = QPushButton("LIMP")
+        self.limp_btn.setFixedWidth(56)
+        self.limp_btn.setToolTip(
+            "Back-drivable bring-up: MIT mode, zero Kp/Kd and assist torque, then "
+            "enable. The motor reports its encoder while free to move by hand - "
+            "for hand-teaching (the sim mirrors it) or moving through the travel "
+            "during calibration.")
+        self.limp_btn.clicked.connect(self._on_make_limp)
+
         self.setup_btn = QToolButton()
         self.setup_btn.setText("Setup")
         self.setup_btn.setCheckable(True)
@@ -143,6 +152,7 @@ class MotorRow(QFrame):
         lay.addWidget(self.angle_lbl)
         lay.addWidget(self.bar, 1)
         lay.addWidget(self.enable_btn)
+        lay.addWidget(self.limp_btn)
         lay.addWidget(self.setup_btn)
         return lay
 
@@ -317,6 +327,28 @@ class MotorRow(QFrame):
         """Emit a position setpoint and record it as the commanded angle."""
         self.set_commanded(rad)
         self.targetChanged.emit(self.device_id, {"position": rad})
+
+    def _on_make_limp(self) -> None:
+        """One-click back-drivable bring-up for hand-teaching / calibration.
+
+        Puts the motor into MIT mode with zero stiffness, damping and assist
+        torque, then enables it, so it holds no position and can be moved freely
+        by hand while still reporting its encoder. Emits the same signals as
+        :meth:`MotorPanel._on_make_limp`; the dashboard forwards them to
+        ``MainWindow``, so the command path and its guards (bus connected,
+        zeroed-since-enable confirmation) are exactly the normal ones. The row
+        has no gain widgets, so the zeroed gains are sent straight as a target.
+        """
+        self.modeChanged.emit(self.device_id, RunMode.MIT)
+        self.targetChanged.emit(
+            self.device_id, {"kp": 0.0, "kd": 0.0, "torque_ff": 0.0})
+        # Enable last so the first MIT frame is already limp. Mirror a real Enable
+        # click (setChecked doesn't emit clicked); MainWindow resets the button via
+        # set_enabled_state if it rejects or the operator backs out.
+        if not self.enable_btn.isChecked():
+            self.enable_btn.setChecked(True)
+            self.enableToggled.emit(self.device_id, True)
+        self.set_action("LIMP: MIT Kp=Kd=0, enabled - free to move by hand")
 
     def set_ab_active(self, active: bool) -> None:
         """Reflect A/B on/off from outside without re-triggering the toggle."""
