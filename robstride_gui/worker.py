@@ -258,6 +258,16 @@ COMM_FAILURE_LIMIT: int = 10
 #: 1 ms; lower this to see every blocking op.
 SLOW_COMMAND_LOG_MS: float = 20.0
 
+#: Max commands ``_drain_commands`` processes in one loop iteration. It used to
+#: drain the queue to empty unconditionally, so any burst - regardless of what
+#: filled the queue - could starve ``_service_motors`` (and every enabled
+#: motor's setpoint/keepalive frame) for the whole burst's duration in one go.
+#: Capping it means a burst spreads across multiple ~10 ms ticks instead of
+#: blocking one tick indefinitely; leftover commands simply wait in the queue
+#: for the next iteration; a handler that raises still lets later commands in
+#: the same batch run (see ``_drain_commands``).
+MAX_COMMANDS_PER_DRAIN: int = 50
+
 #: Motor-side watchdog: the RAW value written to the ``canTimeout`` register
 #: (0x7028) on every Enable. A host-side watchdog cannot help when the *host*
 #: dies (process crash, cable pull): in velocity/current mode the motor would
@@ -277,22 +287,30 @@ SLOW_COMMAND_LOG_MS: float = 20.0
 #: enable handshake, the hold-recovery re-enable starves the next motor, and
 #: after MAX_HOLD_RECOVERY_ATTEMPTS the worker gives up and leaves them off.
 #:
-#: 5000 raw targets ~300 ms at the inferred ~0.06 ms/count - comfortably above
-#: the 92 ms worst-case gap seen on the wire, so ordinary handshake starvation
-#: no longer trips the watchdog. If the unit were actually ms after all, 5000
-#: means a 5 s host-death stop: longer than ideal but still safe, and the
-#: calibration below resolves the ambiguity. VERIFY per hardware with
-#: :func:`recommend_can_timeout_raw` fed a measured point from
-#: :meth:`ControlWorker.measure_can_timeout` (the starve test is the only thing
-#: that proves the real duration).
-MOTOR_CAN_TIMEOUT_RAW: int = 5000
+#: 5000 raw targeted ~300 ms at the inferred ~0.06 ms/count, comfortably above
+#: the 92 ms worst-case handshake gap seen on the wire - but that only covers
+#: starvation from a blocking handshake. :meth:`ControlWorker.measure_can_timeout`
+#: run against motor 3 (2026-07-23) measured the REAL scale directly:
+#: raw=5000 held through 400 ms of silence and dropped between 400-800 ms
+#: (~600 ms, i.e. ~0.12 ms/count - 2x the earlier inferred figure). Separately,
+#: reproducing the worker on its real QThread (not a single-threaded test
+#: harness) showed hold-drops even at *idle*, with no command burst at all -
+#: CPython GIL scheduling contention between the Qt main thread and this
+#: control loop's thread can itself produce gaps wide enough to trip even a
+#: several-hundred-ms window. 25000 raw (~3 s at the measured 0.12 ms/count,
+#: via :func:`recommend_can_timeout_raw`\ (5000, 600.0, 3000.0)) trades a longer
+#: host-death stop time for real headroom against that jitter - acceptable on a
+#: bench setup with an operator present. VERIFY per hardware with a fresh
+#: :meth:`measure_can_timeout` point if this board/firmware differs.
+MOTOR_CAN_TIMEOUT_RAW: int = 25000
 
 #: Target watchdog window, in milliseconds, that :data:`MOTOR_CAN_TIMEOUT_RAW`
-#: is chosen to hit. Wide enough to clear the worst observed servicing gap
-#: (~92 ms) with margin, but short enough to stop a runaway ~this long after a
-#: true host death. Feed it to :func:`recommend_can_timeout_raw` with a measured
-#: calibration point to get the raw value for a given board.
-MOTOR_CAN_TIMEOUT_TARGET_MS: float = 300.0
+#: is chosen to hit. Widened from 300 ms (see :data:`MOTOR_CAN_TIMEOUT_RAW`) to
+#: clear observed GIL-jitter gaps, not just handshake starvation, while still
+#: stopping a genuine runaway within a few seconds of true host death. Feed it
+#: to :func:`recommend_can_timeout_raw` with a measured calibration point to get
+#: the raw value for a given board.
+MOTOR_CAN_TIMEOUT_TARGET_MS: float = 3000.0
 
 
 def recommend_can_timeout_raw(armed_raw: int, observed_stop_ms: float,
@@ -333,6 +351,20 @@ def recommend_can_timeout_raw(armed_raw: int, observed_stop_ms: float,
 #: fault), so the worker stops the retry storm, leaves it disabled, and surfaces
 #: it to the operator rather than energising it every control tick forever.
 MAX_HOLD_RECOVERY_ATTEMPTS: int = 3
+
+#: Consecutive RESET reads required before a hold-drop is treated as real.
+#: ``_await`` matches replies by comm-type + device id only (no sequence
+#: number), so a single stray/late frame could in principle be misread as a
+#: momentary drop. Requiring back-to-back RESET reads, spaced by an actual
+#: control tick, absorbs a one-off misread without spending a recovery
+#: attempt on it. Raised from 2 to 5 (2026-07-23): reproducing the worker on
+#: its real QThread showed CPython GIL scheduling jitter between the Qt main
+#: thread and this control loop can span more than 2 consecutive ~10 ms
+#: ticks even with no command burst - 2 was not always enough to absorb it.
+#: 5 ticks (~50 ms) is still tiny next to the widened
+#: :data:`MOTOR_CAN_TIMEOUT_RAW` (~3 s) budget, so a genuine drop is still
+#: caught quickly.
+HOLD_DROP_DEBOUNCE: int = 5
 
 
 @dataclass(frozen=True)
@@ -424,6 +456,9 @@ class ControlWorker(QObject):
         # while we held it enabled, reset the moment it reports running again. Caps
         # the retry storm at MAX_HOLD_RECOVERY_ATTEMPTS (see _recover_dropped_hold).
         self._hold_recovery_attempts: dict[int, int] = {}
+        # Consecutive RESET reads seen in a row per motor, reset on any MOTOR
+        # (holding) read. See HOLD_DROP_DEBOUNCE.
+        self._reset_streak: dict[int, int] = {}
         # Last VBUS value logged per motor, so the diagnostic power log fires only
         # on a significant voltage move (see VBUS_LOG_DELTA_V), not every sample.
         self._last_logged_vbus: dict[int, float] = {}
@@ -470,7 +505,7 @@ class ControlWorker(QObject):
     # -- command handling --------------------------------------------------------
 
     def _drain_commands(self) -> None:
-        while True:
+        for _ in range(MAX_COMMANDS_PER_DRAIN):
             try:
                 cmd = self._queue.get_nowait()
             except queue.Empty:
@@ -580,6 +615,7 @@ class ControlWorker(QObject):
             self._comm_failures = 0
             self._motor_faults.clear()
             self._hold_recovery_attempts.clear()
+            self._reset_streak.clear()
             self._watchdog_verified.clear()
             self._last_logged_vbus.clear()
             self._last_power.clear()
@@ -722,6 +758,7 @@ class ControlWorker(QObject):
         # An operator disable is a clean slate: forget any in-progress hold-drop
         # recovery so a later manual enable starts its attempt count from zero.
         self._hold_recovery_attempts.pop(device_id, None)
+        self._reset_streak.pop(device_id, None)
         # Re-verify the canTimeout arm on the next enable (the motor may have
         # been power-cycled or reconfigured while disabled).
         self._watchdog_verified.discard(device_id)
@@ -1218,9 +1255,15 @@ class ControlWorker(QObject):
             return
         if status.mode == MotorMode.MOTOR:
             self._hold_recovery_attempts.pop(device_id, None)  # holding again
+            self._reset_streak.pop(device_id, None)
             return
         if status.mode != MotorMode.RESET:
             return  # transient CALI or unknown state - do not act on it
+        streak = self._reset_streak.get(device_id, 0) + 1
+        if streak < HOLD_DROP_DEBOUNCE:
+            self._reset_streak[device_id] = streak
+            return  # one RESET read alone - wait for a second before acting
+        self._reset_streak[device_id] = 0
         attempts = self._hold_recovery_attempts.get(device_id, 0)
         if attempts >= MAX_HOLD_RECOVERY_ATTEMPTS:
             self._hold_recovery_attempts.pop(device_id, None)

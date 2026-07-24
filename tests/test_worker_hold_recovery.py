@@ -102,13 +102,27 @@ def test_status_mode_defaults_to_running():
 # --- recovery behaviour ---------------------------------------------------------
 
 
-def test_standby_drop_triggers_reenable():
+def test_single_reset_tick_does_not_trigger_reenable():
+    # HOLD_DROP_DEBOUNCE requires back-to-back RESET reads before acting, so
+    # one isolated tick must not spend a recovery attempt or enable yet.
     worker, bus = _worker(mode=MotorMode.RESET)
 
     worker._service_motors()
 
+    assert ("enable", 1) not in bus.calls
+    assert 1 not in worker._hold_recovery_attempts
+    assert worker._reset_streak[1] == 1
+
+
+def test_standby_drop_triggers_reenable():
+    worker, bus = _worker(mode=MotorMode.RESET)
+
+    for _ in range(wk.HOLD_DROP_DEBOUNCE):
+        worker._service_motors()
+
     assert ("enable", 1) in bus.calls, "a dropped motor must be re-enabled"
     assert worker._hold_recovery_attempts[1] == 1
+    assert worker._reset_streak[1] == 0
 
 
 def test_running_motor_is_not_reenabled_and_resets_counter():
@@ -126,8 +140,9 @@ def test_persistent_drop_gives_up_disables_and_alerts():
     errors: list[str] = []
     worker.error.connect(errors.append)
 
-    # Tick until the motor is given up on (it stays enabled until then).
-    for _ in range(wk.MAX_HOLD_RECOVERY_ATTEMPTS + 1):
+    # Tick until the motor is given up on (it stays enabled until then). Each
+    # attempt now needs HOLD_DROP_DEBOUNCE consecutive RESET ticks to fire.
+    for _ in range(wk.HOLD_DROP_DEBOUNCE * (wk.MAX_HOLD_RECOVERY_ATTEMPTS + 1)):
         if worker._targets[1].enabled:
             worker._service_motors()
 
@@ -139,16 +154,19 @@ def test_persistent_drop_gives_up_disables_and_alerts():
 
 
 def test_recovered_motor_after_blips_does_not_carry_stale_attempts():
-    # Two isolated drops that each recover on the next tick must not accumulate
+    # Two isolated drops that each recover once debounced must not accumulate
     # toward the give-up limit.
     worker, bus = _worker(mode=MotorMode.RESET)
-    worker._service_motors()                 # drop -> re-enable (attempt 1)
+    for _ in range(wk.HOLD_DROP_DEBOUNCE):
+        worker._service_motors()              # drop -> re-enable (attempt 1)
     assert worker._hold_recovery_attempts[1] == 1
     bus.mode = MotorMode.MOTOR
-    worker._service_motors()                 # holds again -> counter cleared
+    worker._service_motors()                  # holds again -> counters cleared
     assert 1 not in worker._hold_recovery_attempts
+    assert 1 not in worker._reset_streak
     bus.mode = MotorMode.RESET
-    worker._service_motors()                 # a later, unrelated drop starts fresh
+    for _ in range(wk.HOLD_DROP_DEBOUNCE):
+        worker._service_motors()              # a later, unrelated drop starts fresh
     assert worker._hold_recovery_attempts[1] == 1
 
 

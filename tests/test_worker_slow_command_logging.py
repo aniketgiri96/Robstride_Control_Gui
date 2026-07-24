@@ -39,6 +39,23 @@ def test_slow_command_is_logged_with_duration_and_target():
     assert "ms" in line
 
 
+def test_drain_commands_is_bounded_per_call():
+    # A burst larger than MAX_COMMANDS_PER_DRAIN must not be drained in one
+    # call - service_motors needs a turn between bursts so no enabled motor's
+    # keepalive frame is starved by an arbitrarily large queue.
+    worker, _ = _worker_capturing()
+    burst = wk.MAX_COMMANDS_PER_DRAIN * 2
+    for i in range(burst):
+        worker.post(wk.SetTarget(device_id=1, position=float(i)))
+
+    worker._drain_commands()
+    assert worker._queue.qsize() == burst - wk.MAX_COMMANDS_PER_DRAIN
+
+    worker._drain_commands()
+    assert worker._queue.qsize() == 0
+    assert worker._targets[1].position == float(burst - 1)
+
+
 def test_fast_command_is_not_logged():
     # Arrange
     worker, logs = _worker_capturing()

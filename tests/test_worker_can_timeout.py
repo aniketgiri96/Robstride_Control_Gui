@@ -145,11 +145,22 @@ def test_readback_transport_error_is_non_fatal():
 # turns one starve-test point into the raw value for a target window.
 
 def test_recommend_scales_raw_to_hit_target_window():
-    # Arrange: field point - 1000 raw measured as a ~60 ms window.
+    # Arrange: an early field point - 1000 raw measured as a ~60 ms window.
     # Act: ask for the raw that lands on a 300 ms window.
-    # Assert: linear scale => 300/60 * 1000 = 5000, the shipped default.
+    # Assert: linear scale => 300/60 * 1000 = 5000 (pure math check, independent
+    # of whatever raw value is currently shipped as the default).
     assert wk.recommend_can_timeout_raw(1000, 60.0, 300.0) == 5000
-    assert wk.recommend_can_timeout_raw(1000, 60.0, 300.0) == wk.MOTOR_CAN_TIMEOUT_RAW
+
+
+def test_recommend_matches_shipped_default_from_measured_calibration():
+    # Arrange: the real measured calibration point the shipped default is
+    # derived from - measure_can_timeout(3, 5000) on real hardware
+    # (2026-07-23) found 5000 raw held through 400 ms and dropped by 800 ms
+    # silence (~600 ms estimate), and the target was widened to 3000 ms to
+    # cover observed GIL-jitter gaps (see MOTOR_CAN_TIMEOUT_RAW).
+    # Assert: linear scale => 3000/600 * 5000 = 25000, the shipped default.
+    assert wk.recommend_can_timeout_raw(5000, 600.0, 3000.0) == 25000
+    assert wk.recommend_can_timeout_raw(5000, 600.0, 3000.0) == wk.MOTOR_CAN_TIMEOUT_RAW
 
 
 def test_recommend_uses_default_target_when_omitted():

@@ -280,7 +280,17 @@ class RobstrideBus:
     def _read_status(self, device_id: int) -> Optional[MotorStatus]:
         frame = self._await((CommunicationType.OPERATION_STATUS,
                              CommunicationType.FAULT_REPORT), device_id)
-        if frame is None or frame.comm_type == CommunicationType.FAULT_REPORT:
+        if frame is None:
+            return None
+        if frame.comm_type == CommunicationType.FAULT_REPORT:
+            # No vendor bit table for this payload is available yet, so this
+            # cannot be decoded into named flags without guessing - surface the
+            # raw hex at WARNING (visible without ROBSTRIDE_DEBUG=1) instead of
+            # silently discarding it, so a real vs. benign fault report is at
+            # least distinguishable on the wire during hardware debugging.
+            # TODO: decode once a vendor fault-bit table is available.
+            logger.warning("M%d: FAULT_REPORT payload=%s (undecoded)",
+                           device_id, frame.data.hex())
             return None
         return proto.parse_status(frame, self.model_of(device_id))
 
