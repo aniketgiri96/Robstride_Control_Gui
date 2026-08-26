@@ -175,11 +175,60 @@ class SocketCANTransport(Transport):
         self.bitrate = bitrate
         self._bus = None
 
+    #: sysfs IFF_UP bit. A CAN interface can exist and be bindable while
+    #: administratively DOWN, so this flag - not mere existence - is what says
+    #: the kernel will actually transmit on it.
+    _IFF_UP = 0x1
+
+    def _interface_state(self) -> tuple[bool, bool]:
+        """Return ``(exists, is_up)`` for ``self.channel``, read from sysfs.
+
+        python-can binds happily to a down CAN interface and does NOT bring it
+        up (the ``bitrate=`` argument is ignored on Linux - only ``ip link``
+        sets it). So open() appears to succeed and then every send() fails with
+        ENETDOWN, "Failed to transmit: Network is down". Checking the flag here
+        turns that into one actionable error at connect time.
+
+        If the state cannot be determined (no sysfs, e.g. a non-Linux host),
+        report ``(True, True)`` so we never block a connection we cannot verify.
+        """
+        from pathlib import Path
+
+        iface = Path("/sys/class/net") / self.channel
+        if not iface.is_dir():
+            return (False, False)
+        try:
+            flags = int((iface / "flags").read_text().strip(), 16)
+        except (OSError, ValueError):
+            return (True, True)   # unknown - do not stand in the way
+        return (True, bool(flags & self._IFF_UP))
+
     def open(self) -> None:
         try:
             import can
         except ImportError as e:  # pragma: no cover - dependency guard
             raise TransportError("python-can is not installed (pip install python-can)") from e
+        # Fail here, loudly, rather than letting every later send() raise
+        # ENETDOWN one frame at a time (see _interface_state).
+        exists, is_up = self._interface_state()
+        if not exists:
+            raise TransportError(
+                f"SocketCAN interface '{self.channel}' does not exist.\n"
+                f"  Load the driver and create the interface:\n"
+                f"    sudo modprobe can can_raw\n"
+                f"    sudo ip link set {self.channel} up type can "
+                f"bitrate {self.bitrate}\n"
+                f"  If your adapter is the serial USB-CAN dongle, switch the\n"
+                f"  Transport dropdown to 'Serial (AT)' instead.")
+        if not is_up:
+            raise TransportError(
+                f"SocketCAN interface '{self.channel}' exists but is DOWN.\n"
+                f"  Every transmit would fail with 'Network is down'. Bring it up:\n"
+                f"    sudo ip link set {self.channel} up type can "
+                f"bitrate {self.bitrate}\n"
+                f"  Then confirm the bitrate matches the motor "
+                f"(RobStride default 1 Mbit/s):\n"
+                f"    ip -details link show {self.channel}")
         try:
             self._bus = can.interface.Bus(interface="socketcan",
                                           channel=self.channel, bitrate=self.bitrate)
@@ -223,6 +272,50 @@ class SocketCANTransport(Transport):
             return None
         comm_type, extra_data, device_id = proto.split_ext_id(msg.arbitration_id)
         return Frame(comm_type, extra_data, device_id, bytes(msg.data))
+
+
+#: ARPHRD_CAN - the sysfs ``type`` value that marks a network interface as CAN.
+#: Distinguishes a real CAN port from an ethernet/loopback device whose name
+#: happens to start with "can".
+_ARPHRD_CAN = 280
+
+#: Offered when no CAN interface can be enumerated (non-Linux host, or the hub's
+#: driver not loaded yet). Covers the RobStride CAN hub, which exposes can0..can4.
+FALLBACK_CAN_CHANNELS = ("can0", "can1", "can2", "can3", "can4")
+
+
+def list_can_interfaces() -> list[str]:
+    """CAN interfaces present on this machine, naturally sorted.
+
+    Read from sysfs rather than hardcoded, so every port a multi-bus adapter
+    exposes shows up - a RobStride CAN hub presents can0..can4, and a fixed
+    two-entry list silently hides three of them. Sorted numerically so can10
+    follows can9 rather than can1.
+
+    Returns :data:`FALLBACK_CAN_CHANNELS` when nothing can be enumerated, so the
+    dropdown is never empty on a host without sysfs.
+    """
+    from pathlib import Path
+
+    root = Path("/sys/class/net")
+    if not root.is_dir():
+        return list(FALLBACK_CAN_CHANNELS)
+    found = []
+    for iface in root.iterdir():
+        try:
+            if int((iface / "type").read_text().strip()) != _ARPHRD_CAN:
+                continue
+        except (OSError, ValueError):
+            continue
+        found.append(iface.name)
+    if not found:
+        return list(FALLBACK_CAN_CHANNELS)
+    return sorted(found, key=lambda n: (len(n), n))
+
+
+def can_interface_is_up(channel: str) -> bool:
+    """True when ``channel`` is administratively UP (see SocketCANTransport)."""
+    return SocketCANTransport(channel)._interface_state()[1]
 
 
 def _is_usb_serial(device: str, hwid: str) -> bool:
