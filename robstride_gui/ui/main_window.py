@@ -13,7 +13,8 @@ from PySide6.QtCore import Qt, QThread, QTimer, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDockWidget, QHBoxLayout, QInputDialog, QLabel,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox,
+    QDoubleSpinBox, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QScrollArea, QSpinBox,
     QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -43,9 +44,13 @@ ERROR_DIALOG_MIN_INTERVAL_S = 3.0
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, remote: "tuple[str, str] | None" = None):
+        """``remote`` is ``(ssh_target, agent_path)`` to drive a Raspberry Pi
+        instead of local hardware, or None for a directly attached adapter."""
         super().__init__()
-        self.setWindowTitle("RobStride Control")
+        self.remote = remote
+        self.setWindowTitle(
+            "RobStride Control" + (f"  -  remote: {remote[0]}" if remote else ""))
         self.resize(1180, 780)
 
         self.panels: dict[int, MotorPanel] = {}
@@ -79,6 +84,13 @@ class MainWindow(QMainWindow):
         self._refresh_serial_ports()
         self._reload_preset_combo()
 
+        # The remote link starts only once the UI exists. RemoteWorker.run()
+        # emits log/error signals SYNCHRONOUSLY if ssh fails immediately, and
+        # those handlers write to widgets built above - starting it inside
+        # _start_worker would reach a log view that does not exist yet.
+        if self.remote is not None:
+            self.worker.run()
+
         self._plot_timer = QTimer(self)
         self._plot_timer.timeout.connect(self._refresh_plots)
         self._plot_timer.start(PLOT_REFRESH_MS)
@@ -86,10 +98,18 @@ class MainWindow(QMainWindow):
     # -- worker / thread ---------------------------------------------------------
 
     def _start_worker(self) -> None:
-        self.thread = QThread(self)
-        self.worker = wk.ControlWorker()
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
+        if self.remote is None:
+            self.thread = QThread(self)
+            self.worker = wk.ControlWorker()
+            self.worker.moveToThread(self.thread)
+            self.thread.started.connect(self.worker.run)
+        else:
+            # RemoteWorker exposes the same post()/signals surface, but it owns
+            # a pipe rather than a control loop - its run() returns at once, so
+            # it must NOT be moved to a QThread or driven by started.
+            from ..remote_worker import RemoteWorker
+            self.thread = None
+            self.worker = RemoteWorker(self.remote[0], self.remote[1], parent=self)
 
         self.worker.statusUpdated.connect(self._on_status)
         self.worker.powerUpdated.connect(self._on_power)
@@ -106,7 +126,8 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self._append_log)
         self.worker.error.connect(self._on_error)
 
-        self.thread.start()
+        if self.thread is not None:
+            self.thread.start()
 
     # -- UI construction ---------------------------------------------------------
 
@@ -278,6 +299,23 @@ class MainWindow(QMainWindow):
             "Set every motor's zero to its current position")
         self.zero_all_btn.clicked.connect(self._on_zero_all)
         lay.addWidget(self.zero_all_btn)
+
+        # Cruise speed for every position move. In position mode the motor runs
+        # its own trapezoid and this sets the flat part; the model default is
+        # 0.6 x rated, which on an rs-03 is ~286 RPM and makes an entered
+        # position look instant. Shown in RPM to match the rest of the UI.
+        lay.addWidget(QLabel("Speed limit"))
+        self.speed_limit_spin = QDoubleSpinBox()
+        self.speed_limit_spin.setRange(0.0, 400.0)
+        self.speed_limit_spin.setDecimals(0)
+        self.speed_limit_spin.setSuffix(" RPM")
+        self.speed_limit_spin.setValue(0.0)          # 0 = model default
+        self.speed_limit_spin.setSpecialValueText("model default")
+        self.speed_limit_spin.setToolTip(
+            "Maximum cruise speed for position moves. 0 uses the model's own "
+            "limit. Applies to every motor and survives reconnecting.")
+        self.speed_limit_spin.valueChanged.connect(self._on_speed_limit_changed)
+        lay.addWidget(self.speed_limit_spin)
 
         self.estop_btn = QPushButton("E-STOP")
         self.estop_btn.setCheckable(True)
@@ -924,6 +962,11 @@ class MainWindow(QMainWindow):
             for device_id in self.dashboard.rows:
                 self.dashboard.set_enabled_state(device_id, False)
 
+    def _on_speed_limit_changed(self, rpm: float) -> None:
+        """Push the speed cap to the worker. 0 means the model default."""
+        value = None if rpm <= 0 else float(rpm) * proto.RPM_TO_RAD_S
+        self.worker.post(wk.SetVelocityLimit(value=value))
+
     def _on_disable_all(self) -> None:
         """De-energise every motor and reflect the disabled state in the UI."""
         ids = list(self.panels)
@@ -1027,8 +1070,9 @@ class MainWindow(QMainWindow):
         try:
             self.sim_dock.shutdown()
             self.worker.stop()
-            self.thread.quit()
-            self.thread.wait(2000)
+            if self.thread is not None:
+                self.thread.quit()
+                self.thread.wait(2000)
             self.datalog.close()
         finally:
             super().closeEvent(event)

@@ -41,6 +41,22 @@ _POSITION_MODES = (RunMode.POSITION_PP, RunMode.POSITION_CSP)
 # it drives an attached part through a hard stop.
 RANGE_TRIP_MARGIN_RAD = math.radians(5.0)
 
+#: Profiled-position acceleration written to acc_set (0x7025), rad/s^2, or None
+#: to leave the motor's own value alone.
+#:
+#: This is the register that actually governs speed on this hardware. limit_spd
+#: (0x7017) is stored and read back correctly and then IGNORED: measured on an
+#: rs-04, a 5 rad move ran at 37 RPM sustained against a 5 RPM cap the motor
+#: confirmed holding. acc_set does work, and the motor runs a TRIANGULAR profile
+#: because the speed cap never engages - so peak speed is sqrt(acc * distance):
+#:
+#:     acc_set = 10.0  ->  predicted 67.5 RPM, measured 64.6
+#:     acc_set =  0.5  ->  predicted 15.1 RPM, measured 14.9
+#:
+#: Note this couples speed to DISTANCE: short moves stay quick, long moves get
+#: faster. For a peak of v over a typical move of d, use acc = v^2 / d.
+MOTOR_ACCEL_RAD_S2 = 2.0
+
 
 # --- command objects pushed from the UI -----------------------------------------
 
@@ -1208,6 +1224,12 @@ class ControlWorker(QObject):
         if lim.torque_max is not None:
             self._bus.write_param(device_id, ParameterType.TORQUE_LIMIT,
                                   float(lim.torque_max))
+        # Written on every enable for the same reason as the two above: a
+        # run-mode rewrite can reset the motor's limit registers, and this is
+        # the one that actually bounds how fast a position move goes.
+        if MOTOR_ACCEL_RAD_S2 is not None:
+            self._bus.write_param(device_id, ParameterType.PP_ACCELERATION_TARGET,
+                                  float(MOTOR_ACCEL_RAD_S2))
 
     def _configure_motor_watchdog(self, device_id: int) -> None:
         """Arm the motor's own CAN watchdog before enabling it.
